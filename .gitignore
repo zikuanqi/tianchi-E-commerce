@@ -6,6 +6,13 @@ __pycache__/
 .Python
 .ipynb_checkpoints/
 
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+
 # Distribution / packaging
 build/
 dist/
