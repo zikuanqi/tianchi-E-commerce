@@ -101,14 +101,14 @@ def set_seeds(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if torch.cuda.is_available():  # pragma: no cover - GPU-only
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
+    if torch.cuda.is_available():  # pragma: no cover - GPU-only
         return torch.device('cuda')
     return torch.device('cpu')
 
@@ -125,7 +125,7 @@ def report_memory(stage: str = '') -> Dict[str, float]:
         'rss_gb': info.rss / 1024 ** 3,
         'vms_gb': info.vms / 1024 ** 3,
     }
-    if torch.cuda.is_available():
+    if torch.cuda.is_available():  # pragma: no cover - GPU-only
         snapshot['cuda_allocated_gb'] = torch.cuda.memory_allocated() / 1024 ** 3
         snapshot['cuda_reserved_gb'] = torch.cuda.memory_reserved() / 1024 ** 3
     logger.info('Memory %s: %s', stage,

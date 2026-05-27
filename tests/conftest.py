@@ -38,11 +38,12 @@ def _make_synthetic_users(n_users: int = 50,
 
 
 def _make_synthetic_items(user_data: pd.DataFrame) -> pd.DataFrame:
-    items = (user_data[['item_id', 'item_category']]
-             .drop_duplicates()
-             .rename(columns={'item_category': 'category'}))
+    """Match the official Tianchi P table schema:
+    `item_id, item_geohash, item_category`. `load_data` then renames
+    `item_category` → `category` — so we exercise that rename branch."""
+    items = user_data[['item_id', 'item_category']].drop_duplicates()
     items['item_geohash'] = ''
-    return items[['item_id', 'item_geohash', 'category']]
+    return items[['item_id', 'item_geohash', 'item_category']]
 
 
 @pytest.fixture

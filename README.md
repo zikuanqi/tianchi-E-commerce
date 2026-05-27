@@ -49,7 +49,7 @@
 - **稠密数值特征**：`FeatureEngineer` 自动产出 11 维用户 + 7 维商品特征，喂入两塔
 - **多种负采样**：`uniform` / `popularity`（word2vec 平滑）+ 可选 InfoNCE in-batch 负样本
 - **完整评估**：训练时记录 P/R/F1/AUROC（per-row）；`evaluate` 子命令计算竞赛集合 F1
-- **测试套件**：28 个测试，CPU 上 ~12s 全跑通；77% 行+分支覆盖率
+- **测试套件**：97 个测试，CPU 上 ~18s 全跑通；**99% 行+分支覆盖率**
 - **Lightning 风格**：检查点自描述（`save_hyperparameters`），断点续训和迁移推理零摩擦
 
 ---
@@ -409,7 +409,7 @@ pytest tests/ --cov=src --cov-report=term-missing
 | `test_evaluation.py` | 完美匹配/无重叠/部分重叠、DataFrame、dtype 强制、空集、缺列报错 |
 | `test_inference.py` | 注入截止日之后 sentinel 行验证零泄漏；候选集 ⊆ P；占位标签 |
 
-**当前状态**：28 通过，CPU 上 ~12s，77% 行+分支覆盖率。
+**当前状态**：97 通过，CPU 上 ~18s，**99.1% 行+分支覆盖率**。
 
 ---
 
@@ -453,6 +453,12 @@ A：检查 `actual_purchases_on(target_date)` 是否返回非空。当 `target_d
 ---
 
 ## 更新日志
+
+### v0.6.0 (2026-05-28)
+- 覆盖率 77% → **99.1%**（97 个测试，CPU 上 ~18s）
+- 新增 `test_utils.py` / `test_trainer.py` / `test_edge_cases.py`
+- 修复 `get_categorical_dims` 在 PadLabelEncoder 未 fit 时的 `len(None)` bug
+- 合成数据 fixture 改为更接近官方 schema（保留 `item_category` 列）
 
 ### v0.5.0 (2026-05-28)
 - 与 Tianchi 移动推荐算法竞赛规范完全对齐

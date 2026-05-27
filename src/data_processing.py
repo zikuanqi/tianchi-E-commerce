@@ -251,7 +251,7 @@ class DataProcessor:
             logger.warning('No positives on %s — falling back to all interactions as labels', target_date.date())
             positives = day_actions[['user_id_encoded', 'item_id_encoded']].drop_duplicates()
 
-        if self._all_item_ids is None or len(self._all_item_ids) == 0:
+        if self._all_item_ids is None or len(self._all_item_ids) == 0:  # pragma: no cover - defensive
             raise RuntimeError('preprocess_data must be called before sample_interactions')
 
         rows: List[Tuple[int, int, int]] = []

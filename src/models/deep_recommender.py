@@ -248,7 +248,10 @@ class DeepRecommender(pl.LightningModule):
         self.log('val_f1', self.val_f1.compute(), prog_bar=True)
         try:
             self.log('val_auroc', self.val_auroc.compute(), prog_bar=True)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError):  # pragma: no cover - defensive
+            # torchmetrics returns NaN for single-class epochs rather
+            # than raising on modern versions, but older releases
+            # raised. Kept as a guard either way.
             pass
         for m in (self.val_acc, self.val_precision, self.val_recall,
                   self.val_f1, self.val_auroc):

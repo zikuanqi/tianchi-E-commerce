@@ -72,3 +72,11 @@ def test_load_checkpoint_reconstructs_model(config, tmp_path):
     scores = fresh.predict(test_ds)
     assert scores.shape[0] == len(test_ds)
     assert (scores >= 0).all() and (scores <= 1).all()
+
+
+def test_train_with_no_datasets_builds_them_internally(config):
+    """`train()` with no args should call prepare_data itself and
+    proceed — this covers the default-argument branch."""
+    trainer = ModelTrainer(config)
+    metrics = trainer.train()    # no datasets passed
+    assert 'train_loss' in metrics or 'train_loss_epoch' in metrics

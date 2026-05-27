@@ -142,6 +142,21 @@ def test_reduce_memory_usage_downcasts_ints():
     assert after <= before
 
 
+def test_reduce_memory_usage_skips_non_numeric_columns():
+    """Object/string columns must pass through untouched (covers the
+    'neither integer nor float' branch in the dtype dispatch)."""
+    df = pd.DataFrame({
+        'i': pd.Series([1, 2, 3], dtype='int64'),
+        'f': pd.Series([1.5, 2.5, 3.5], dtype='float64'),
+        's': pd.Series(['a', 'b', 'c']),   # object
+    })
+    out = reduce_memory_usage(df)
+    # Untouched — accept either the legacy object dtype or the modern StringDtype.
+    assert pd.api.types.is_string_dtype(out['s'])
+    # Numeric columns still got downcast.
+    assert out['i'].dtype.itemsize < 8
+
+
 # ---------------------------------------------------------------------------
 # JSON IO
 # ---------------------------------------------------------------------------
