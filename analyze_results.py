@@ -1,15 +1,16 @@
-import pandas as pd
-import numpy as np
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
+from typing import Dict
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
 import torch
-import json
 from sklearn.manifold import TSNE
-from sklearn.metrics import confusion_matrix, roc_curve, auc
-import pytorch_lightning as pl
-from torch.utils.data import DataLoader
+from sklearn.metrics import auc, confusion_matrix, roc_curve
 
 # 设置日志
 logging.basicConfig(
@@ -88,7 +89,10 @@ class ResultAnalyzer:
     def visualization_analysis(self):
         """可视化分析"""
         # 创建图形
-        plt.style.use('seaborn')
+        try:
+            plt.style.use('seaborn-v0_8')
+        except OSError:
+            plt.style.use('default')
         fig = plt.figure(figsize=(15, 10))
         
         # 1. 用户推荐分布
