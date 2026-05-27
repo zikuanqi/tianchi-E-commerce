@@ -67,18 +67,23 @@ python main.py validate-config
 # 4. 数据分析（需要 data/raw/ 下的原始 CSV）
 python main.py analyze-data
 
-# 5. 训练 / 预测 / 全流程
+# 5. 训练 / 预测 / 评估 / 全流程
 python main.py train
-python main.py predict
+python main.py predict              # 严格不偷看 pred_date，输出 tianchi_mobile_recommendation_predict.csv
+python main.py evaluate \
+    --target-date 2014-12-19 \
+    --cutoff-date 2014-12-18         # 在留出日上计算竞赛集合 F1
 python main.py run-all
 ```
 
 ### 数据准备
 
-将下列文件放入 `data/raw/`：
+将官方数据放入 `data/raw/`：
 
-- `tianchi_fresh_comp_train_user_2w.csv`
-- `tianchi_fresh_comp_train_item_2w.csv`
+- `tianchi_fresh_comp_train_user.csv`（用户行为全集 D，2014-11-18 ~ 2014-12-18）
+- `tianchi_fresh_comp_train_item.csv`（商品子集 P，推荐结果必须落在 P 内）
+
+若使用第三方分发的 `_2w` 子集，请修改 `config.yaml` 的 `data.paths.raw_user_data` / `raw_item_data` 指向实际文件。
 
 ## 模型架构
 
@@ -125,6 +130,20 @@ seq_behav ──► Behavior Embedding ──concat──► Linear ──► Po
 
 特征 StandardScaler 标准化，并截断到 ±5 σ。零向量用于训练时未见过的冷启动用户/商品。这些数值特征与对应的嵌入向量拼接后进入两塔 MLP。
 
+## 竞赛规范对齐
+
+| 规范 | 实现 |
+|---|---|
+| 数据集 D：`user_id, item_id, behavior_type, user_geohash, item_category, time` | `DataProcessor.load_data` 按此 schema 加载，`item_category` 重命名为 `category` |
+| 商品子集 P：`item_id, item_geohash, item_category` | 同上；`_all_item_ids` 从 P 提取，所有候选/推荐都限定在 P |
+| `behavior_type` ∈ {1 浏览, 2 收藏, 3 加购, 4 购买} | `PURCHASE_BEHAVIOR = 4`，序列嵌入 `num_behaviors=5`（0=PAD） |
+| 训练数据 11.18 ~ 12.18，预测 12.19 | `training.train_end_date: 2014-12-18` / `pred_date: 2014-12-19` |
+| 推荐必须在 P 内 | `build_inference_candidates` 强制过滤；测试覆盖 |
+| 推理不能"偷看"预测日 | `prepare_inference_data` 只用截止日及之前的历史；有专门的反泄漏测试 |
+| 输出文件名 `tianchi_mobile_recommendation_predict.csv` | `main.py predict` 写入该文件名，UTF-8 |
+| 列：`user_id, item_id`，string 类型，去重 | `create_submission` 强制 `astype(str)` + `drop_duplicates` |
+| 评测：集合 P/R/F1 | `src.evaluation.set_precision_recall_f1`；`main.py evaluate` 报告 |
+
 ## 评估指标
 
 通过 `torchmetrics` 在每个验证 epoch 计算并记录：
@@ -153,6 +172,15 @@ python -m pytest tests/ -v
 綦子宽
 
 ## 更新日志
+
+### v0.5.0 (2026-05-28)
+- 与 Tianchi 移动推荐算法竞赛规范完全对齐
+- 提交文件名改为 `tianchi_mobile_recommendation_predict.csv`，UTF-8，强制 string + 去重
+- 拆分推理路径：`prepare_inference_data` 严格不偷看预测日；`prepare_eval_data` 保留给训练验证
+- 候选集限定在商品子集 P + 用户近期历史；新增 `evaluate` CLI 子命令报告竞赛集合 F1
+- `set_precision_recall_f1` 工具函数与 7 项单元测试
+- 默认数据文件名改为官方名称（去掉 `_2w` 后缀）
+- 测试套件扩展到 35 个
 
 ### v0.4.0 (2026-05-28)
 - 验证集新增 P/R/F1/AUROC 指标

@@ -11,8 +11,12 @@ system:
 
 data:
   paths:
-    raw_user_data: 'data/raw/tianchi_fresh_comp_train_user_2w.csv'
-    raw_item_data: 'data/raw/tianchi_fresh_comp_train_item_2w.csv'
+    # Canonical Tianchi filenames per
+    # https://tianchi.aliyun.com/competition/entrance/231522/information
+    # If you've downloaded a redistributed 2-week subset, point these
+    # at e.g. 'data/raw/tianchi_fresh_comp_train_user_2w.csv'.
+    raw_user_data: 'data/raw/tianchi_fresh_comp_train_user.csv'
+    raw_item_data: 'data/raw/tianchi_fresh_comp_train_item.csv'
     processed_data_dir: 'data/processed'
     output_dir: 'data/output'
     checkpoint_dir: 'data/checkpoints'
