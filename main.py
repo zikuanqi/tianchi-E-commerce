@@ -77,15 +77,14 @@ def predict(config: str, test_date: str, checkpoint: str) -> None:
         ckpt = checkpoint or str(Path(cfg['data']['paths']['checkpoint_dir']) / 'last.ckpt')
         trainer.load_checkpoint(ckpt)
 
-        test_ds = trainer.data_processor.prepare_test_data(test_date)
-        scores = trainer.predict(test_ds)
-
-        import pandas as pd
-        interactions_df = pd.DataFrame({
-            'user_id': test_ds.user_ids.numpy(),
-            'item_id': test_ds.item_ids.numpy(),
-        })
-        submission = trainer.data_processor.create_submission(scores, interactions_df)
+        # Real prediction flow: build candidates from history strictly
+        # BEFORE the prediction day. `test_date` here is the cutoff —
+        # data from after it must never be seen.
+        inference_ds, candidates = trainer.data_processor.prepare_inference_data(
+            cutoff_date=test_date,
+        )
+        scores = trainer.predict(inference_ds)
+        submission = trainer.data_processor.create_submission(scores, candidates)
 
         output_dir = Path(cfg['data']['paths']['output_dir'])
         output_dir.mkdir(parents=True, exist_ok=True)

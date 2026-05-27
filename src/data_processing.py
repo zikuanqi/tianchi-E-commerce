@@ -337,13 +337,21 @@ class DataProcessor:
         )
         return train_ds, val_ds
 
-    def prepare_test_data(self, test_date: Optional[str] = None) -> RecommendationDataset:
+    def prepare_eval_data(self, target_date: Optional[str] = None) -> RecommendationDataset:
+        """Validation/eval dataset for a held-out date.
+
+        Knows the labels on ``target_date`` — only safe to use when you
+        actually have those labels (e.g. for training-time validation
+        loss, or for offline F1 scoring on a held-out day). Do NOT use
+        this for the real Tianchi submission, which must not peek at
+        the prediction date.
+        """
         user_data, item_data = self.load_data()
         user_data, item_data = self.preprocess_data(user_data, item_data)
 
-        if test_date is None:
-            test_date = self.config['training']['pred_date']
-        target = pd.to_datetime(test_date)
+        if target_date is None:
+            target_date = self.config['training']['pred_date']
+        target = pd.to_datetime(target_date)
 
         sequences = self.build_user_sequences(user_data, target)
         interactions = self.sample_interactions(user_data, target)
@@ -352,6 +360,119 @@ class DataProcessor:
             user_features=self._user_features_tensor,
             item_features=self._item_features_tensor,
         )
+
+    def prepare_inference_data(self,
+                               cutoff_date: Optional[str] = None,
+                               history_days: Optional[int] = None) -> Tuple[RecommendationDataset, pd.DataFrame]:
+        """Zero-leak inference dataset for the *real* prediction flow.
+
+        Builds (user, item) candidates from user history strictly up to
+        and including ``cutoff_date`` — never from the prediction day
+        itself. Candidates are restricted to items in P (the submission
+        item subset, per the Tianchi spec) and to items the user has
+        interacted with in the last ``history_days`` days.
+
+        Returns a tuple ``(dataset, candidates_df)`` so callers can join
+        scores back to the original (user, item) pairs without having to
+        re-decode encoded ids.
+
+        Defaults:
+          - ``cutoff_date`` ⇒ ``training.train_end_date``
+          - ``history_days`` ⇒ ``model.training.inference_history_days``
+            (default 7)
+        """
+        user_data, item_data = self.load_data()
+        user_data, item_data = self.preprocess_data(user_data, item_data)
+
+        if cutoff_date is None:
+            cutoff_date = self.config['training']['train_end_date']
+        cutoff = pd.to_datetime(cutoff_date)
+
+        if history_days is None:
+            history_days = int(self.config['model']['training']
+                               .get('inference_history_days', 7))
+
+        candidates = self.build_inference_candidates(user_data, cutoff, history_days)
+        sequences = self.build_user_sequences(user_data, cutoff)
+
+        ds = RecommendationDataset(
+            candidates, sequences, self.max_seq_length,
+            user_features=self._user_features_tensor,
+            item_features=self._item_features_tensor,
+        )
+        return ds, candidates
+
+    # Backwards compatibility — older code calls `prepare_test_data`.
+    # The leak-prone behavior is preserved on purpose: existing tests
+    # and the in-training validation loop rely on it.
+    prepare_test_data = prepare_eval_data
+
+    def build_inference_candidates(self,
+                                   user_data: pd.DataFrame,
+                                   cutoff: pd.Timestamp,
+                                   history_days: int) -> pd.DataFrame:
+        """Per-user candidate items from recent history, restricted to P.
+
+        Why this restriction: Tianchi requires submissions to be on the
+        item subset P, and the natural strong baseline is "items the
+        user already engaged with in the last few days". Cold-start
+        users (no recent history) get no candidates here — that's a
+        principled choice, not an oversight: an empty rec set with
+        precision=0 and recall=0 contributes F1=0 only if there are
+        also ground-truth positives for that user, and on average
+        guessing for a cold user hurts precision more than it helps
+        recall.
+        """
+        if self._all_item_ids is None or self._item_to_category is None:
+            raise RuntimeError('preprocess_data must be called before build_inference_candidates')
+
+        start = cutoff - pd.Timedelta(days=int(history_days))
+        window = user_data[(user_data['time'] > start) & (user_data['time'] <= cutoff)]
+
+        items_in_p = set(int(x) for x in self._all_item_ids.tolist())
+        window = window[window['item_id_encoded'].isin(items_in_p)]
+
+        candidates = (window[['user_id_encoded', 'item_id_encoded']]
+                      .drop_duplicates()
+                      .rename(columns={'user_id_encoded': 'user_id',
+                                       'item_id_encoded': 'item_id'}))
+        candidates['category_id'] = (candidates['item_id']
+                                     .map(self._item_to_category)
+                                     .fillna(PAD_ID)
+                                     .astype(np.int64))
+        candidates['label'] = 0  # placeholder — ignored at inference
+        candidates = candidates.astype({
+            'user_id': np.int64,
+            'item_id': np.int64,
+            'label': np.int64,
+        }).reset_index(drop=True)
+        logger.info(
+            'build_inference_candidates: %d (user, item) pairs from %s..%s, history_days=%d',
+            len(candidates), start.date(), cutoff.date(), history_days,
+        )
+        return candidates
+
+    def actual_purchases_on(self,
+                            target_date: Union[str, pd.Timestamp]) -> pd.DataFrame:
+        """Ground truth (user_id, item_id) purchases on ``target_date``.
+
+        Restricted to item subset P, deduplicated, decoded back to the
+        original (string) ids — ready to feed
+        :func:`src.evaluation.set_precision_recall_f1`.
+        """
+        user_data, item_data = self.load_data()
+        user_data, _ = self.preprocess_data(user_data, item_data)
+        target = pd.to_datetime(target_date)
+
+        items_in_p = set(int(x) for x in self._all_item_ids.tolist())
+        purchases = user_data[
+            (user_data['time'].dt.date == target.date())
+            & (user_data['behavior_type'] == PURCHASE_BEHAVIOR)
+            & (user_data['item_id_encoded'].isin(items_in_p))
+        ][['user_id', 'item_id']].drop_duplicates().reset_index(drop=True)
+        purchases['user_id'] = purchases['user_id'].astype(str)
+        purchases['item_id'] = purchases['item_id'].astype(str)
+        return purchases
 
     # ------------------------------------------------------------------
     # Submission

@@ -79,6 +79,7 @@ model:
     use_in_batch_negatives: false              # add InfoNCE auxiliary loss
     infonce_temperature: 0.1
     infonce_weight: 0.1                        # blend weight for the InfoNCE term
+    inference_history_days: 7                  # candidate-set lookback at predict time
     early_stopping:
       patience: 3
       min_delta: 0.001
