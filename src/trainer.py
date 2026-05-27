@@ -1,189 +1,185 @@
-import logging
-import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
-from typing import Dict, List, Tuple, Union
-import numpy as np
-from pathlib import Path
-import yaml
-import gc
-import psutil
-import os
-from tqdm import tqdm
-import functools
-from torch.utils.data import DataLoader
+"""Training/inference orchestrator built on PyTorch Lightning."""
 
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Dict, Optional, Tuple, Union
+
+import numpy as np
+import pytorch_lightning as pl
+import torch
+import yaml
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+
+from src.data.dataloader import build_dataloader
 from src.data.dataset import RecommendationDataset
 from src.data_processing import DataProcessor
 from src.models.deep_recommender import DeepRecommender
-from src.utils import setup_logging, timer
+from src.utils import report_memory, set_seeds, setup_logging
+
 logger = logging.getLogger(__name__)
 
-# 首先定义装饰器
-def memory_optimize(func):
-    """内存优化装饰器"""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        gc.collect()
-        torch.cuda.empty_cache()
-        try:
-            result = func(*args, **kwargs)
-            return result
-        finally:
-            gc.collect()
-            torch.cuda.empty_cache()
-    return wrapper
 
 class ModelTrainer:
-    def __init__(self, config: Union[str, dict]):
-        """初始化训练器"""
+    """Wraps DataProcessor + DeepRecommender + pl.Trainer.
+
+    The trainer is CPU-friendly: it picks up whatever device the config
+    requests but never raises if a GPU isn't present. It also defers
+    model construction until it knows the categorical vocab sizes —
+    those come from `DataProcessor.get_categorical_dims()` after the
+    first call to `prepare_train_val_data`.
+    """
+
+    def __init__(self, config: Union[str, Path, dict]):
         if isinstance(config, (str, Path)):
-            with open(config) as f:
+            with open(config, 'r', encoding='utf-8') as f:
                 self.config = yaml.safe_load(f)
         elif isinstance(config, dict):
             self.config = config
         else:
-            raise TypeError("config must be either a path (str) or a dictionary")
+            raise TypeError('config must be a path or a dict')
 
-        setup_logging(self.config['logging'])
-        self.check_gpu_and_optimize()
+        setup_logging(self.config.get('logging', {}))
+        set_seeds(int(self.config.get('system', {}).get('seed', 42)))
+
         self.data_processor = DataProcessor(self.config)
-        self.model = DeepRecommender(self.config)
+        self.model: Optional[DeepRecommender] = None
+        self.pl_trainer: Optional[pl.Trainer] = None
+        self._resolve_device()
 
-    def monitor_memory_usage(self):
-        """监控内存使用情况"""
-        process = psutil.Process(os.getpid())
-        memory_info = process.memory_info()
-        
-        logger.info(f"Memory Usage: {memory_info.rss / 1024 / 1024 / 1024:.2f}GB")
-        logger.info(f"Virtual Memory: {memory_info.vms / 1024 / 1024 / 1024:.2f}GB")
-        if torch.cuda.is_available():
-            logger.info(f"GPU Memory Allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
-            logger.info(f"GPU Memory Reserved: {torch.cuda.memory_reserved()/1024**3:.2f}GB")
+    # ------------------------------------------------------------------
+    # Device & trainer setup
+    # ------------------------------------------------------------------
+    def _resolve_device(self) -> None:
+        """Honor the config's accelerator request but downgrade silently."""
+        requested = str(self.config.get('device', {}).get('accelerator', 'auto')).lower()
+        cuda_ok = torch.cuda.is_available()
+        if requested == 'gpu' and not cuda_ok:
+            logger.warning('Config requested GPU but CUDA is unavailable — falling back to CPU')
+            self.config['device']['accelerator'] = 'cpu'
+            self.config['device']['precision'] = 32
+        elif requested == 'auto':
+            self.config['device']['accelerator'] = 'gpu' if cuda_ok else 'cpu'
+        logger.info('Using accelerator: %s', self.config['device']['accelerator'])
 
-    def check_gpu_and_optimize(self):
-        """检查 GPU 并进行优化设置"""
-        if not torch.cuda.is_available():
-            raise RuntimeError("No GPU available!")
-        
-        gpu_name = torch.cuda.get_device_name(0)
-        if 'A100' not in gpu_name:
-            logger.warning(f"Expected NVIDIA A100, but found {gpu_name}")
-        
-        gpu_props = torch.cuda.get_device_properties(0)
-        total_memory = gpu_props.total_memory / 1024**3
-        
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        torch.cuda.set_per_process_memory_fraction(0.95)
-        
-        logger.info(f"Using GPU: {gpu_name} with {total_memory:.2f}GB memory")
-        return total_memory
+    def _build_pl_trainer(self) -> pl.Trainer:
+        device_cfg = self.config['device']
+        train_cfg = self.config['model']['training']
+        paths = self.config['data']['paths']
 
-    def setup_training(self) -> Tuple[pl.Trainer, List]:
-        """设置训练器"""
-        gpu_memory = self.check_gpu_and_optimize()
-        
-        if hasattr(self, 'dynamic_batch_size'):
-            batch_size = self.calculate_optimal_batch_size(gpu_memory)
-            self.config['model']['training']['batch_size'] = batch_size
-            logger.info(f"Dynamically set batch size to: {batch_size}")
-        
-        trainer = pl.Trainer(
-            accelerator='gpu',
-            devices=[0],
-            precision=16,
-            strategy='auto',
-            callbacks=[
-                ModelCheckpoint(
-                    dirpath=self.config['data']['paths']['checkpoint_dir'],
-                    filename='model-{epoch:02d}-{val_loss:.2f}',
-                    save_top_k=3,
-                    mode='min'
-                ),
-                EarlyStopping(
-                    monitor='val_loss',
-                    patience=self.config['model']['training']['early_stopping']['patience'],
-                    mode='min'
-                )
-            ],
-            logger=TensorBoardLogger(
-                save_dir=self.config['data']['paths']['log_dir'],
-                name='lightning_logs'
+        Path(paths['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
+        Path(paths['log_dir']).mkdir(parents=True, exist_ok=True)
+
+        callbacks = [
+            ModelCheckpoint(
+                dirpath=paths['checkpoint_dir'],
+                filename='model-{epoch:02d}-{val_loss:.4f}',
+                monitor='val_loss',
+                mode='min',
+                save_top_k=3,
+                save_last=True,
             ),
-            gradient_clip_val=1.0,
-            log_every_n_steps=50,
-            max_epochs=self.config['model']['training']['num_epochs']
-        )
-        
-        return trainer
+            EarlyStopping(
+                monitor='val_loss',
+                patience=int(train_cfg['early_stopping']['patience']),
+                min_delta=float(train_cfg['early_stopping']['min_delta']),
+                mode='min',
+            ),
+        ]
 
-    def create_dataloaders(self, train_dataset: RecommendationDataset, valid_dataset: RecommendationDataset) -> Tuple[DataLoader, DataLoader]:
-        """创建优化的数据加载器"""
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config['model']['training']['batch_size'],
-            shuffle=True,
-            num_workers=self.config['system']['num_workers'],
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=self.config['system']['prefetch_factor'],
-            drop_last=True,
-            generator=torch.Generator(device='cuda')
-        )
-
-        valid_loader = DataLoader(
-            valid_dataset,
-            batch_size=self.config['model']['training']['batch_size'],
-            shuffle=False,
-            num_workers=max(1, self.config['system']['num_workers'] // 2),
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
+        opt_cfg = train_cfg.get('optimization', {})
+        return pl.Trainer(
+            accelerator=device_cfg['accelerator'],
+            devices=device_cfg.get('devices', 'auto'),
+            precision=device_cfg.get('precision', 32),
+            max_epochs=int(train_cfg['num_epochs']),
+            callbacks=callbacks,
+            logger=TensorBoardLogger(save_dir=paths['log_dir'], name='lightning_logs'),
+            gradient_clip_val=float(opt_cfg.get('gradient_clip_val', 1.0)),
+            accumulate_grad_batches=int(opt_cfg.get('accumulate_grad_batches', 1)),
+            log_every_n_steps=10,
+            enable_progress_bar=True,
         )
 
-        return train_loader, valid_loader
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def prepare_data(self) -> Tuple[RecommendationDataset, RecommendationDataset]:
+        report_memory('before prepare_train_val_data')
+        train_ds, val_ds = self.data_processor.prepare_train_val_data()
+        report_memory('after prepare_train_val_data')
+        logger.info('Datasets: train=%d, val=%d', len(train_ds), len(val_ds))
+        return train_ds, val_ds
 
-    @memory_optimize  # 现在可以使用这个装饰器了
-    def train(self):
-        """训练模型"""
-        try:
-            self.monitor_memory_usage()
-            
-            logger.info("Preparing training data...")
-            train_data, val_data = self.data_processor.prepare_train_val_data()
-            
-            self.monitor_memory_usage()
-            
-            train_loader, val_loader = self.create_dataloaders(train_data, val_data)
-            trainer = self.setup_training()
-            
-            logger.info("Starting model training...")
-            trainer.fit(self.model, train_loader, val_loader)
-            
-            self.monitor_memory_usage()
-            
-        except Exception as e:
-            logger.error(f"Error during training: {str(e)}")
-            raise
+    def build_model(self) -> DeepRecommender:
+        vocab_sizes = self.data_processor.get_categorical_dims()
+        if not vocab_sizes:
+            raise RuntimeError('No vocab sizes available — call prepare_data first')
+        logger.info('Building model with vocab sizes: %s', vocab_sizes)
+        self.model = DeepRecommender(self.config, vocab_sizes=vocab_sizes)
+        return self.model
 
-    def save_model(self):
-        """保存模型和配置"""
-        output_dir = Path(self.config['data']['paths']['output_dir'])
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        model_path = output_dir / 'model.pt'
-        torch.save(self.model.state_dict(), model_path)
-        
-        config_path = output_dir / 'config.yaml'
-        with open(config_path, 'w') as f:
-            yaml.dump(self.config, f)
-            
-        logger.info(f"Model and config saved to {output_dir}")
+    def train(self,
+              train_dataset: Optional[RecommendationDataset] = None,
+              val_dataset: Optional[RecommendationDataset] = None) -> Dict[str, float]:
+        """Run a full training loop. Datasets are optional; built if missing."""
+        if train_dataset is None or val_dataset is None:
+            train_dataset, val_dataset = self.prepare_data()
 
-if __name__ == "__main__":
-    trainer = ModelTrainer('config/config.yaml')
-    trainer.train()
+        if self.model is None:
+            self.build_model()
+
+        sys_cfg = self.config.get('system', {})
+        train_cfg = self.config['model']['training']
+        batch_size = int(train_cfg['batch_size'])
+        # Multi-process loading on Windows requires `if __name__ == "__main__"`
+        # guards everywhere, which we can't enforce; default to 0 workers.
+        num_workers = 0 if torch.multiprocessing.get_start_method(allow_none=True) == 'spawn' \
+            else int(sys_cfg.get('num_workers', 0))
+        pin_memory = bool(sys_cfg.get('pin_memory', False)) and torch.cuda.is_available()
+
+        train_loader = build_dataloader(train_dataset, batch_size, shuffle=True,
+                                        num_workers=num_workers, pin_memory=pin_memory)
+        val_loader = build_dataloader(val_dataset, batch_size, shuffle=False,
+                                      num_workers=num_workers, pin_memory=pin_memory)
+
+        self.pl_trainer = self._build_pl_trainer()
+        self.pl_trainer.fit(self.model, train_loader, val_loader)
+
+        # Collect final metrics from the callback metrics dict.
+        metrics = {k: float(v) for k, v in self.pl_trainer.callback_metrics.items()}
+        logger.info('Training complete. Metrics: %s', metrics)
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    def load_checkpoint(self, ckpt_path: Union[str, Path]) -> DeepRecommender:
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(ckpt_path)
+        logger.info('Loading checkpoint %s', ckpt_path)
+        self.model = DeepRecommender.load_from_checkpoint(str(ckpt_path))
+        # Hyperparameters live inside the checkpoint; sync our config so
+        # downstream consumers (DataProcessor) see the same training cfg.
+        ckpt_cfg = self.model.hparams.get('config') if hasattr(self.model, 'hparams') else None
+        if isinstance(ckpt_cfg, dict):
+            self.config = ckpt_cfg
+            self.data_processor = DataProcessor(self.config)
+        return self.model
+
+    def predict(self, dataset: RecommendationDataset) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError('predict called before model was built or loaded')
+        train_cfg = self.config['model']['training']
+        batch_size = int(train_cfg['batch_size'])
+
+        loader = build_dataloader(dataset, batch_size, shuffle=False,
+                                  num_workers=0, pin_memory=False)
+        if self.pl_trainer is None:
+            self.pl_trainer = self._build_pl_trainer()
+
+        outputs = self.pl_trainer.predict(self.model, loader)
+        return torch.cat(outputs, dim=0).detach().cpu().numpy()
