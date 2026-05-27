@@ -39,10 +39,12 @@ class RecommendationDataset(Dataset):
         if missing:
             raise ValueError(f'interactions missing columns: {missing}')
 
-        self.user_ids = torch.as_tensor(interactions['user_id'].to_numpy(), dtype=torch.long)
-        self.item_ids = torch.as_tensor(interactions['item_id'].to_numpy(), dtype=torch.long)
-        self.category_ids = torch.as_tensor(interactions['category_id'].to_numpy(), dtype=torch.long)
-        self.labels = torch.as_tensor(interactions['label'].to_numpy(), dtype=torch.float)
+        # `.to_numpy(copy=True)` to make the underlying array writable —
+        # otherwise PyTorch emits an "non-writable tensor" warning.
+        self.user_ids = torch.as_tensor(interactions['user_id'].to_numpy(copy=True), dtype=torch.long)
+        self.item_ids = torch.as_tensor(interactions['item_id'].to_numpy(copy=True), dtype=torch.long)
+        self.category_ids = torch.as_tensor(interactions['category_id'].to_numpy(copy=True), dtype=torch.long)
+        self.labels = torch.as_tensor(interactions['label'].to_numpy(copy=True), dtype=torch.float)
 
         self.sequences = sequences
         self.max_seq_length = int(max_seq_length)

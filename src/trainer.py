@@ -11,7 +11,14 @@ import pytorch_lightning as pl
 import torch
 import yaml
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import CSVLogger
+
+try:
+    from pytorch_lightning.loggers import TensorBoardLogger
+    _HAS_TENSORBOARD = True
+except ImportError:  # pragma: no cover - tensorboard is optional
+    TensorBoardLogger = None  # type: ignore[assignment]
+    _HAS_TENSORBOARD = False
 
 from src.data.dataloader import build_dataloader
 from src.data.dataset import RecommendationDataset
@@ -90,13 +97,22 @@ class ModelTrainer:
         ]
 
         opt_cfg = train_cfg.get('optimization', {})
+        if _HAS_TENSORBOARD:
+            try:
+                pl_logger = TensorBoardLogger(save_dir=paths['log_dir'], name='lightning_logs')
+            except ModuleNotFoundError:
+                # tensorboardX/tensorboard not actually importable at runtime
+                pl_logger = CSVLogger(save_dir=paths['log_dir'], name='csv_logs')
+        else:
+            pl_logger = CSVLogger(save_dir=paths['log_dir'], name='csv_logs')
+
         return pl.Trainer(
             accelerator=device_cfg['accelerator'],
             devices=device_cfg.get('devices', 'auto'),
             precision=device_cfg.get('precision', 32),
             max_epochs=int(train_cfg['num_epochs']),
             callbacks=callbacks,
-            logger=TensorBoardLogger(save_dir=paths['log_dir'], name='lightning_logs'),
+            logger=pl_logger,
             gradient_clip_val=float(opt_cfg.get('gradient_clip_val', 1.0)),
             accumulate_grad_batches=int(opt_cfg.get('accumulate_grad_batches', 1)),
             log_every_n_steps=10,
