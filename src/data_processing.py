@@ -1,304 +1,286 @@
-import gc
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-import yaml
-from typing import Tuple, Dict, Union, List
+"""Data processing pipeline for the Tianchi mobile-recommendation dataset.
+
+The pipeline is intentionally linear:
+
+    raw csv -> load_data -> preprocess_data -> build_sequences ->
+    sample_interactions -> RecommendationDataset
+
+`prepare_train_val_data` and `prepare_test_data` are the two public entry
+points used by the CLI.
+"""
+
+from __future__ import annotations
+
 import logging
-from src.utils import setup_logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import random_split
-from tqdm import tqdm
+import yaml
+from sklearn.preprocessing import LabelEncoder
+
+from src.data.dataset import RecommendationDataset
+from src.utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
-class DataProcessor:
-    """数据处理类"""
 
-    def __init__(self, config: Union[str, dict]):
-        """初始化数据处理器"""
-        # 处理配置
+PURCHASE_BEHAVIOR = 4
+PAD_ID = 0
+
+
+class DataProcessor:
+    """End-to-end data loader/featurizer for the Tianchi dataset."""
+
+    def __init__(self, config: Union[str, Path, dict]):
         if isinstance(config, (str, Path)):
-            with open(config) as f:
+            with open(config, 'r', encoding='utf-8') as f:
                 self.config = yaml.safe_load(f)
         elif isinstance(config, dict):
             self.config = config
         else:
-            raise TypeError("config must be either a path (str) or a dictionary")
+            raise TypeError('config must be a path or a dict')
 
-        setup_logging(self.config['logging'])
+        setup_logging(self.config.get('logging', {}))
 
-        # 初始化编码器
-        self.encoders = {}
-        for feature in self.config['data']['features']['categorical']:
-            self.encoders[feature] = LabelEncoder()
-    
-        # 初始化标准化器
-        self.scalers = {
-            'numerical_features': StandardScaler()
-        }   
+        self.categorical_features: List[str] = self.config['data']['features']['categorical']
+        self.encoders: Dict[str, LabelEncoder] = {f: LabelEncoder() for f in self.categorical_features}
+        self.max_seq_length: int = self.config['data']['features']['sequence']['max_length']
+        self.neg_ratio: int = int(self.config['model']['training'].get('negative_sampling_ratio', 4))
+        self.rng = np.random.default_rng(self.config.get('system', {}).get('seed', 42))
 
+        # Populated during preprocess_data
+        self._all_item_ids: Optional[np.ndarray] = None
+        self._item_to_category: Optional[Dict[int, int]] = None
 
+    # ------------------------------------------------------------------
+    # Raw load + preprocessing
+    # ------------------------------------------------------------------
     def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """加载原始数据"""
-        logger.info("Loading raw data...")
+        paths = self.config['data']['paths']
+        logger.info('Loading raw data from %s and %s', paths['raw_user_data'], paths['raw_item_data'])
 
-        # Load user data
-        user_data = pd.read_csv(self.config['data']['paths']['raw_user_data'])
-        # Convert time column to datetime
-        user_data['time'] = pd.to_datetime(user_data['time'], format='%Y-%m-%d %H')
-    
-        # Load item data
-        item_data = pd.read_csv(self.config['data']['paths']['raw_item_data'])
+        user_data = pd.read_csv(paths['raw_user_data'])
+        item_data = pd.read_csv(paths['raw_item_data'])
 
-        # Rename category columns if needed
         if 'item_category' in user_data.columns:
             user_data = user_data.rename(columns={'item_category': 'category'})
         if 'item_category' in item_data.columns:
             item_data = item_data.rename(columns={'item_category': 'category'})
 
-        logger.info(f"Loaded {len(user_data)} user records and {len(item_data)} item records")
+        user_data['time'] = pd.to_datetime(user_data['time'], format='%Y-%m-%d %H')
+        logger.info('Loaded %d user actions and %d item rows', len(user_data), len(item_data))
         return user_data, item_data
 
-    def preprocess_data(self, user_data: pd.DataFrame, item_data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """数据预处理"""
-        logger.info("Preprocessing data...")
-        try:
-            # 首先对所有分类特征进行 fit
-            categorical_features = self.config['data']['features']['categorical']
-            for feature in categorical_features:
-                if feature not in self.encoders:
-                    self.encoders[feature] = LabelEncoder()
-                if feature in user_data.columns:
-                    self.encoders[feature].fit(user_data[feature].astype(str))
-                if feature in item_data.columns and not hasattr(self.encoders[feature], 'classes_'):
-                    self.encoders[feature].fit(item_data[feature].astype(str))
-        
-            # 时间处理
-            user_data['time'] = pd.to_datetime(user_data['time'])
-            user_data['hour'] = user_data['time'].dt.hour
-            user_data['day'] = user_data['time'].dt.day
-            user_data['weekday'] = user_data['time'].dt.weekday
-        
-            # 生成序列特征
-            max_seq_length = self.config['data']['features']['sequence']['max_length']
-            logger.info("Generating sequence features...")
-        
-            # 按用户和时间排序
-            user_data = user_data.sort_values(['user_id', 'time'])
-        
-            # 对每个用户生成序列
-            sequences = user_data.groupby('user_id').agg({
-                'item_id': lambda x: list(x)[-max_seq_length:],
-                'behavior_type': lambda x: list(x)[-max_seq_length:],
-                'category': lambda x: list(x)[-max_seq_length:]
-            }).reset_index()
-        
-            # 编码序列中的特征
-            sequences['item_sequence'] = sequences['item_id'].apply(
-                lambda x: [self.encoders['item_id'].transform([str(i)])[0] for i in x] + 
-                         [0] * (max_seq_length - len(x))
-            )
-            sequences['behavior_sequence'] = sequences['behavior_type'].apply(
-                lambda x: x + [0] * (max_seq_length - len(x))
-            )
-            sequences['category_sequence'] = sequences['category'].apply(
-                lambda x: [self.encoders['category'].transform([str(i)])[0] for i in x] + 
-                     [0] * (max_seq_length - len(x))
-            )
-        
-            # 添加序列长度
-            sequences['sequence_length'] = sequences['item_id'].apply(len)
-        
-            # 合并序列特征回原始数据
-            user_data = pd.merge(
-                user_data,
-                sequences[['user_id', 'item_sequence', 'behavior_sequence', 
-                      'category_sequence', 'sequence_length']],
-                on='user_id',
-                how='left'
-            )
-        
-            # 编码分类特征
-            for feature in categorical_features:
-                if feature in user_data.columns:
-                    user_data[f'{feature}_encoded'] = self.encoders[feature].transform(
-                        user_data[feature].astype(str)
-                    )
-                if feature in item_data.columns:
-                    item_data[f'{feature}_encoded'] = self.encoders[feature].transform(
-                        item_data[feature].astype(str)
-                    )
-        
-            logger.info("Data preprocessing completed")
-            return user_data, item_data
-        
-        except Exception as e:
-            logger.error(f"Error during preprocessing: {str(e)}")
-            raise
+    def preprocess_data(self,
+                        user_data: pd.DataFrame,
+                        item_data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Label-encode categorical columns; add time features.
 
-    def create_feature_dict(self, user_data: pd.DataFrame, item_data: pd.DataFrame) -> Dict:
-        """创建特征字典"""
+        Encoders are fit on the union of values appearing in `user_data` and
+        `item_data` so we never get an unseen-label error at inference time.
+        """
+        logger.info('Encoding categorical features %s', self.categorical_features)
+
+        for feat in self.categorical_features:
+            values: List[str] = []
+            if feat in user_data.columns:
+                values.append(user_data[feat].astype(str))
+            if feat in item_data.columns:
+                values.append(item_data[feat].astype(str))
+            if not values:
+                logger.warning('Categorical feature %s not present in user/item data', feat)
+                continue
+            combined = pd.concat(values, ignore_index=True)
+            # Reserve 0 for padding/unknown by adding a sentinel before fit.
+            sentinel = pd.Series(['<pad>'])
+            self.encoders[feat].fit(pd.concat([sentinel, combined], ignore_index=True))
+
+            if feat in user_data.columns:
+                user_data[f'{feat}_encoded'] = self.encoders[feat].transform(user_data[feat].astype(str))
+            if feat in item_data.columns:
+                item_data[f'{feat}_encoded'] = self.encoders[feat].transform(item_data[feat].astype(str))
+
+        user_data['hour'] = user_data['time'].dt.hour
+        user_data['day'] = user_data['time'].dt.day
+        user_data['weekday'] = user_data['time'].dt.weekday
+
+        self._all_item_ids = np.asarray(item_data['item_id_encoded'].unique())
+        if 'category_encoded' in item_data.columns:
+            self._item_to_category = dict(
+                zip(item_data['item_id_encoded'].astype(int),
+                    item_data['category_encoded'].astype(int))
+            )
+        else:
+            self._item_to_category = {}
+        return user_data, item_data
+
+    # ------------------------------------------------------------------
+    # Sequence building
+    # ------------------------------------------------------------------
+    def build_user_sequences(self,
+                             user_data: pd.DataFrame,
+                             end_date: pd.Timestamp) -> Dict[int, Dict[str, np.ndarray]]:
+        """Per-user behavior sequence up to (and including) `end_date`."""
+        max_len = self.max_seq_length
+        filtered = user_data[user_data['time'] <= end_date]
+        filtered = filtered.sort_values(['user_id_encoded', 'time'])
+
+        sequences: Dict[int, Dict[str, np.ndarray]] = {}
+        for user_id, group in filtered.groupby('user_id_encoded'):
+            tail = group.tail(max_len)
+            seq_len = len(tail)
+            items = np.full(max_len, PAD_ID, dtype=np.int64)
+            behaviors = np.full(max_len, PAD_ID, dtype=np.int64)
+            # mask: True at positions to be IGNORED by attention (i.e. padding)
+            mask = np.ones(max_len, dtype=bool)
+            items[:seq_len] = tail['item_id_encoded'].values
+            behaviors[:seq_len] = tail['behavior_type'].values
+            mask[:seq_len] = False
+            sequences[int(user_id)] = {
+                'items': items,
+                'behaviors': behaviors,
+                'mask': mask,
+                'length': np.int64(seq_len),
+            }
+        logger.info('Built sequences for %d users (max_len=%d)', len(sequences), max_len)
+        return sequences
+
+    # ------------------------------------------------------------------
+    # Positive / negative interaction sampling
+    # ------------------------------------------------------------------
+    def sample_interactions(self,
+                            user_data: pd.DataFrame,
+                            target_date: pd.Timestamp) -> pd.DataFrame:
+        """Build (user, item, label) rows for the given day.
+
+        Positives are purchase actions (behavior_type==4) on `target_date`.
+        Negatives are random items the user did not buy on that date.
+        """
+        day_actions = user_data[user_data['time'].dt.date == target_date.date()]
+        positives = day_actions[day_actions['behavior_type'] == PURCHASE_BEHAVIOR][
+            ['user_id_encoded', 'item_id_encoded']
+        ].drop_duplicates()
+
+        if positives.empty:
+            logger.warning('No positives on %s — falling back to all interactions as labels', target_date.date())
+            positives = day_actions[['user_id_encoded', 'item_id_encoded']].drop_duplicates()
+
+        if self._all_item_ids is None or len(self._all_item_ids) == 0:
+            raise RuntimeError('preprocess_data must be called before sample_interactions')
+
+        rows: List[Tuple[int, int, int]] = []
+        user_pos: Dict[int, set] = {}
+        for u, i in zip(positives['user_id_encoded'].values, positives['item_id_encoded'].values):
+            user_pos.setdefault(int(u), set()).add(int(i))
+            rows.append((int(u), int(i), 1))
+
+        all_items = self._all_item_ids
+        n_items = len(all_items)
+        for user_id, pos_items in user_pos.items():
+            needed = self.neg_ratio * len(pos_items)
+            # Oversample to account for collisions with positives.
+            sampled = self.rng.choice(all_items, size=needed + len(pos_items), replace=True)
+            kept = 0
+            for item_id in sampled:
+                if kept >= needed:
+                    break
+                item_id_int = int(item_id)
+                if item_id_int in pos_items:
+                    continue
+                rows.append((user_id, item_id_int, 0))
+                kept += 1
+
+        df = pd.DataFrame(rows, columns=['user_id', 'item_id', 'label'])
+        df['category_id'] = df['item_id'].map(self._item_to_category).fillna(PAD_ID).astype(np.int64)
+        logger.info('Sampled %d interactions on %s (pos=%d, neg=%d)',
+                    len(df), target_date.date(),
+                    int(df['label'].sum()), int((df['label'] == 0).sum()))
+        return df
+
+    # ------------------------------------------------------------------
+    # Categorical dimensions for embedding tables
+    # ------------------------------------------------------------------
+    def get_categorical_dims(self) -> Dict[str, int]:
         return {
-            'user_features': {
-                'categorical': {
-                    feat: torch.tensor(user_data[f'{feat}_encoded'].values)
-                    for feat in self.config['data']['features']['user']['categorical']
-                },
-                'numerical': torch.tensor(
-                    user_data[self.config['data']['features']['user']['numerical']].values
-                )
-            },
-            'item_features': {
-                'categorical': {
-                    feat: torch.tensor(item_data[f'{feat}_encoded'].values)
-                    for feat in self.config['data']['features']['item']['categorical']
-                },
-                'numerical': torch.tensor(
-                    item_data[self.config['data']['features']['item']['numerical']].values
-                )if self.config['data']['features']['item']['numerical'] else torch.tensor([])
-            },
-            'sequence_features': {
-                'items': torch.tensor(user_data['item_sequence'].tolist()),
-                'behaviors': torch.tensor(user_data['behavior_sequence'].tolist()),
-                'categories': torch.tensor(user_data['category_sequence'].tolist()),
-                'lengths': torch.tensor(user_data['sequence_length'].values)
-            },
-            'labels': torch.tensor(
-                (user_data['behavior_type'] == 4).astype(float).values
-            )
+            feat: len(enc.classes_)
+            for feat, enc in self.encoders.items()
+            if hasattr(enc, 'classes_')
         }
 
-    def generate_sequence_features(self, user_data: pd.DataFrame) -> pd.DataFrame:
-        """生成序列特征"""
-        max_seq_length = self.config['data']['features']['sequence']['max_length']
-        
-        # 按用户和时间排序
-        user_data = user_data.sort_values(['user_id', 'time'])
-        
-        # 生成行为序列
-        sequences = user_data.groupby('user_id').agg({
-            'item_id_encoded': lambda x: list(x)[-max_seq_length:],
-            'behavior_type': lambda x: list(x)[-max_seq_length:],
-            'time': lambda x: list(x)[-max_seq_length:]
-        }).reset_index()
-        
-        # 填充序列
-        sequences['sequence_length'] = sequences['item_id_encoded'].apply(len)
-        sequences['item_sequence'] = sequences['item_id_encoded'].apply(
-            lambda x: x + [0] * (max_seq_length - len(x)))
-        sequences['behavior_sequence'] = sequences['behavior_type'].apply(
-            lambda x: x + [0] * (max_seq_length - len(x)))
-        
-        return pd.merge(user_data, sequences[['user_id', 'item_sequence', 'behavior_sequence', 'sequence_length']], 
-                       on='user_id', how='left')
-
-    def prepare_train_val_data(self) -> Tuple[Dict, Dict]:
-        """准备训练和验证数据"""
+    # ------------------------------------------------------------------
+    # Public entry points
+    # ------------------------------------------------------------------
+    def prepare_train_val_data(self) -> Tuple[RecommendationDataset, RecommendationDataset]:
         user_data, item_data = self.load_data()
-        processed_user_data, processed_item_data = self.preprocess_data(user_data, item_data)
-        
-        # 分割训练和验证数据
-        train_end_date = pd.to_datetime(self.config['training']['train_end_date'])
+        user_data, item_data = self.preprocess_data(user_data, item_data)
+
+        train_end = pd.to_datetime(self.config['training']['train_end_date'])
         val_date = pd.to_datetime(self.config['training']['pred_date'])
-        
-        train_data = processed_user_data[processed_user_data['time'] <= train_end_date]
-        val_data = processed_user_data[processed_user_data['time'].dt.date == val_date.date()]
-        
-        # 创建特征字典
-        train_features = self.create_feature_dict(train_data, processed_item_data)
-        val_features = self.create_feature_dict(val_data, processed_item_data)
-        
-        return train_features, val_features
 
-    def create_feature_dict(self, user_data: pd.DataFrame, item_data: pd.DataFrame) -> Dict:
-        """创建特征字典"""
-        feature_dict = {
-            'user_features': {
-                'categorical': {
-                    feat: torch.tensor(user_data[f'{feat}_encoded'].values)
-                    for feat in self.config['data']['features']['user']['categorical']
-                }
-            },
-            'item_features': {
-                'categorical': {
-                    feat: torch.tensor(item_data[f'{feat}_encoded'].values)
-                    for feat in self.config['data']['features']['item']['categorical']
-                }
-            },
-            'sequence_features': {
-                'items': torch.tensor(user_data['item_sequence'].tolist()),
-                'behaviors': torch.tensor(user_data['behavior_sequence'].tolist()),
-                'lengths': torch.tensor(user_data['sequence_length'].values)
-            },
-            'labels': torch.tensor(
-                (user_data['behavior_type'] == 4).astype(float).values
-            )
-        }
+        # Sequences are built only from history up to train_end so we don't
+        # leak validation labels into the user's behavior representation.
+        sequences = self.build_user_sequences(user_data, train_end)
 
-        # Add numerical features if they exist
-        user_numerical = self.config['data']['features']['user']['numerical']
-        if user_numerical:
-            feature_dict['user_features']['numerical'] = torch.tensor(
-                user_data[user_numerical].values
-            )
-        else:
-            feature_dict['user_features']['numerical'] = torch.tensor([])
+        train_interactions = self.sample_interactions(user_data, train_end)
+        val_interactions = self.sample_interactions(user_data, val_date)
 
-        item_numerical = self.config['data']['features']['item']['numerical']
-        if item_numerical:
-            feature_dict['item_features']['numerical'] = torch.tensor(
-                item_data[item_numerical].values
-            )
-        else:
-            feature_dict['item_features']['numerical'] = torch.tensor([])
+        train_ds = RecommendationDataset(train_interactions, sequences, self.max_seq_length)
+        val_ds = RecommendationDataset(val_interactions, sequences, self.max_seq_length)
+        return train_ds, val_ds
 
-        return feature_dict
+    def prepare_test_data(self, test_date: Optional[str] = None) -> RecommendationDataset:
+        user_data, item_data = self.load_data()
+        user_data, item_data = self.preprocess_data(user_data, item_data)
 
-    def prepare_test_data(self, test_date: str = None) -> Dict:
-        """准备测试数据"""
         if test_date is None:
             test_date = self.config['training']['pred_date']
-            
-        user_data, item_data = self.load_data()
-        processed_user_data, processed_item_data = self.preprocess_data(user_data, item_data)
-        
-        test_data = processed_user_data[
-            processed_user_data['time'].dt.date == pd.to_datetime(test_date).date()
-        ]
-        
-        return self.create_feature_dict(test_data, processed_item_data)
+        target = pd.to_datetime(test_date)
 
-    def calculate_sequence_stats(self, user_data: pd.DataFrame) -> Dict:
-        """计算序列统计信息"""
-        sequence_lengths = user_data.groupby('user_id').size()
+        sequences = self.build_user_sequences(user_data, target)
+        interactions = self.sample_interactions(user_data, target)
+        return RecommendationDataset(interactions, sequences, self.max_seq_length)
+
+    # ------------------------------------------------------------------
+    # Submission
+    # ------------------------------------------------------------------
+    def create_submission(self,
+                          predictions: np.ndarray,
+                          interactions: pd.DataFrame) -> pd.DataFrame:
+        """Build a top-k submission DataFrame from raw scores.
+
+        `predictions` must align row-wise with `interactions`.
+        """
+        if len(predictions) != len(interactions):
+            raise ValueError('predictions and interactions must have the same length')
+
+        df = interactions[['user_id', 'item_id']].copy()
+        df['score'] = predictions
+        # Decode back to original IDs.
+        df['user_id'] = self.encoders['user_id'].inverse_transform(df['user_id'].astype(int))
+        df['item_id'] = self.encoders['item_id'].inverse_transform(df['item_id'].astype(int))
+
+        top_k = int(self.config['training'].get('top_k', 20))
+        df = (df.sort_values(['user_id', 'score'], ascending=[True, False])
+                .groupby('user_id', sort=False).head(top_k)
+                .reset_index(drop=True))
+        return df[['user_id', 'item_id']]
+
+    # ------------------------------------------------------------------
+    # Stats (used by `analyze-data` CLI)
+    # ------------------------------------------------------------------
+    def calculate_sequence_stats(self, user_data: pd.DataFrame) -> Dict[str, float]:
+        lengths = user_data.groupby('user_id').size()
         return {
-            'avg_length': sequence_lengths.mean(),
-            'max_length': sequence_lengths.max(),
-            'min_length': sequence_lengths.min()
+            'avg_length': float(lengths.mean()),
+            'max_length': int(lengths.max()),
+            'min_length': int(lengths.min()),
         }
 
-    def create_submission(self, predictions: np.ndarray, test_data: Dict) -> pd.DataFrame:
-        """创建提交文件"""
-        user_ids = self.encoders['user_id'].inverse_transform(test_data['user_features']['categorical']['user_id'])
-        item_ids = self.encoders['item_id'].inverse_transform(test_data['item_features']['categorical']['item_id'])
-        
-        submission = pd.DataFrame({
-            'user_id': user_ids,
-            'item_id': item_ids,
-            'score': predictions
-        })
-        
-        # 筛选top-k推荐
-        top_k = self.config['training']['top_k']
-        submission = submission.groupby('user_id').apply(
-            lambda x: x.nlargest(top_k, 'score')
-        ).reset_index(drop=True)
-        
-        return submission[['user_id', 'item_id']]
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     processor = DataProcessor('config/config.yaml')
-    train_features, val_features = processor.prepare_train_val_data()
-    logger.info("Data preparation completed successfully")
+    train_ds, val_ds = processor.prepare_train_val_data()
+    logger.info('train=%d val=%d', len(train_ds), len(val_ds))
