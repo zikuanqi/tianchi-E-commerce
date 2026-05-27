@@ -1,105 +1,77 @@
+"""PyTorch Dataset over (user, item, label) interactions with per-user sequences."""
+
+from __future__ import annotations
+
+from typing import Dict, Mapping
+
+import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
-import pandas as pd
-import numpy as np
-from typing import Dict, Optional
+
 
 class RecommendationDataset(Dataset):
-    """推荐系统数据集类"""
-    
-    def __init__(self, 
-                 features: Dict[str, torch.Tensor],
-                 user_data: pd.DataFrame,
-                 end_date: str,
-                 config: dict,
-                 labels: Optional[torch.Tensor] = None):
-        """
-        初始化数据集
-        Args:
-            features: 特征字典
-            user_data: 用户行为数据
-            end_date: 结束日期
-            config: 配置字典
-            labels: 标签数据
-        """
-        self.features = features
-        self.config = config
-        self.labels = labels
-        
-        # 处理序列特征
-        self.sequence_features = self._process_sequences(user_data, end_date)
-        
-        # 获取用户和商品列表
-        self.users = torch.tensor(list(features['user_features'].keys()))
-        self.items = torch.tensor(list(features['item_features'].keys()))
-        
-    def _process_sequences(self, user_data: pd.DataFrame, end_date: str) -> Dict[str, torch.Tensor]:
-        """处理行为序列"""
-        max_len = self.config['data']['features']['sequence']['max_length']
-        
-        # 按用户分组并获取序列
-        sequences = {}
-        for user_id, group in user_data.groupby('user_id_encoded'):
-            # 获取时间截止前的行为
-            group = group[group['time'] <= pd.to_datetime(end_date)]
-            group = group.sort_values('time')
-            
-            # 提取最近的行为序列
-            recent_actions = group.iloc[-max_len:]
-            
-            # 创建序列特征
-            seq_len = len(recent_actions)
-            item_seq = np.zeros(max_len, dtype=np.int64)
-            behavior_seq = np.zeros(max_len, dtype=np.int64)
-            time_seq = np.zeros(max_len, dtype=np.float32)
-            
-            # 填充序列
-            item_seq[:seq_len] = recent_actions['item_id_encoded'].values
-            behavior_seq[:seq_len] = recent_actions['behavior_type'].values
-            time_seq[:seq_len] = recent_actions['time'].astype(np.int64).values
-            
-            # 创建掩码
-            mask = np.ones(max_len, dtype=np.bool_)
-            mask[:seq_len] = False
-            
-            sequences[user_id] = {
-                'items': torch.tensor(item_seq),
-                'behaviors': torch.tensor(behavior_seq),
-                'times': torch.tensor(time_seq),
-                'mask': torch.tensor(mask),
-                'length': torch.tensor(seq_len)
-            }
-            
-        return sequences
+    """Pair-wise recommendation dataset.
+
+    Each item is one (user, candidate-item, label) row plus the user's
+    recent behavior sequence. The model treats this as a binary
+    classification problem (click/purchase vs. random negative).
+
+    Parameters
+    ----------
+    interactions:
+        DataFrame with columns ``user_id``, ``item_id``, ``category_id``,
+        ``label``. All ids are already label-encoded ints.
+    sequences:
+        Mapping ``user_id -> {items, behaviors, mask, length}`` produced by
+        :meth:`DataProcessor.build_user_sequences`.
+    max_seq_length:
+        Length of the (padded) per-user sequence — used to synthesize a
+        zero sequence for users absent from ``sequences``.
+    """
+
+    def __init__(self,
+                 interactions: pd.DataFrame,
+                 sequences: Mapping[int, Dict[str, np.ndarray]],
+                 max_seq_length: int):
+        required = {'user_id', 'item_id', 'category_id', 'label'}
+        missing = required - set(interactions.columns)
+        if missing:
+            raise ValueError(f'interactions missing columns: {missing}')
+
+        self.user_ids = torch.as_tensor(interactions['user_id'].to_numpy(), dtype=torch.long)
+        self.item_ids = torch.as_tensor(interactions['item_id'].to_numpy(), dtype=torch.long)
+        self.category_ids = torch.as_tensor(interactions['category_id'].to_numpy(), dtype=torch.long)
+        self.labels = torch.as_tensor(interactions['label'].to_numpy(), dtype=torch.float)
+
+        self.sequences = sequences
+        self.max_seq_length = int(max_seq_length)
+        self._empty_seq = {
+            'items': torch.zeros(self.max_seq_length, dtype=torch.long),
+            'behaviors': torch.zeros(self.max_seq_length, dtype=torch.long),
+            'mask': torch.ones(self.max_seq_length, dtype=torch.bool),
+            'length': torch.tensor(0, dtype=torch.long),
+        }
 
     def __len__(self) -> int:
-        """返回数据集大小"""
-        return len(self.users)
-    
+        return len(self.user_ids)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """获取单个样本"""
-        user_id = self.users[idx]
-        
-        # 获取用户特征
-        user_features = self.features['user_features'][user_id]
-        
-        # 获取序列特征
-        sequence = self.sequence_features.get(user_id.item(), {
-            'items': torch.zeros(self.config['data']['features']['sequence']['max_length'], dtype=torch.long),
-            'behaviors': torch.zeros(self.config['data']['features']['sequence']['max_length'], dtype=torch.long),
-            'times': torch.zeros(self.config['data']['features']['sequence']['max_length']),
-            'mask': torch.ones(self.config['data']['features']['sequence']['max_length'], dtype=torch.bool),
-            'length': torch.tensor(0)
-        })
-        
-        # 组装样本
-        sample = {
-            'user_id': user_id,
-            'user_features': user_features,
-            'sequence': sequence
+        user_id = int(self.user_ids[idx].item())
+        seq_np = self.sequences.get(user_id)
+        if seq_np is None:
+            sequence = self._empty_seq
+        else:
+            sequence = {
+                'items': torch.as_tensor(seq_np['items'], dtype=torch.long),
+                'behaviors': torch.as_tensor(seq_np['behaviors'], dtype=torch.long),
+                'mask': torch.as_tensor(seq_np['mask'], dtype=torch.bool),
+                'length': torch.as_tensor(seq_np['length'], dtype=torch.long),
+            }
+        return {
+            'user_id': self.user_ids[idx],
+            'item_id': self.item_ids[idx],
+            'category_id': self.category_ids[idx],
+            'sequence': sequence,
+            'label': self.labels[idx],
         }
-        
-        if self.labels is not None:
-            sample['labels'] = self.labels[idx]
-            
-        return sample
