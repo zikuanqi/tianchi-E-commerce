@@ -361,6 +361,10 @@ class DataProcessor:
                           interactions: pd.DataFrame) -> pd.DataFrame:
         """Build a top-k submission DataFrame from raw scores.
 
+        Conforms to the Tianchi spec: two string columns ``user_id`` and
+        ``item_id``, deduplicated, UTF-8 (encoding is the caller's job
+        at ``to_csv`` time).
+
         `predictions` must align row-wise with `interactions`.
         """
         if len(predictions) != len(interactions):
@@ -372,10 +376,19 @@ class DataProcessor:
         df['user_id'] = self.encoders['user_id'].inverse_transform(df['user_id'].astype(int))
         df['item_id'] = self.encoders['item_id'].inverse_transform(df['item_id'].astype(int))
 
+        # If multiple rows in the candidate set share the same (user,
+        # item) pair (can happen when candidates are built from history
+        # spanning several days), keep the row with the highest score.
+        df = df.sort_values('score', ascending=False).drop_duplicates(['user_id', 'item_id'])
+
         top_k = int(self.config['training'].get('top_k', 20))
         df = (df.sort_values(['user_id', 'score'], ascending=[True, False])
                 .groupby('user_id', sort=False).head(top_k)
                 .reset_index(drop=True))
+
+        # Spec says both columns must be string-typed.
+        df['user_id'] = df['user_id'].astype(str)
+        df['item_id'] = df['item_id'].astype(str)
         return df[['user_id', 'item_id']]
 
     # ------------------------------------------------------------------

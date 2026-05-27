@@ -89,8 +89,9 @@ def predict(config: str, test_date: str, checkpoint: str) -> None:
 
         output_dir = Path(cfg['data']['paths']['output_dir'])
         output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = output_dir / 'submission.csv'
-        submission.to_csv(out_path, index=False)
+        # Filename required by the Tianchi 移动推荐算法 submission spec.
+        out_path = output_dir / 'tianchi_mobile_recommendation_predict.csv'
+        submission.to_csv(out_path, index=False, encoding='utf-8')
         logger.info('Wrote %d rows to %s', len(submission), out_path)
     except Exception as exc:
         logger.exception('Prediction failed')
