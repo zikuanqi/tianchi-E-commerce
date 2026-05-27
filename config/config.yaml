@@ -74,6 +74,8 @@ model:
     learning_rate: 0.001
     weight_decay: 0.0001
     negative_sampling_ratio: 4   # number of negatives per positive
+    negative_sampling_strategy: 'popularity'   # 'uniform' | 'popularity'
+    negative_sampling_alpha: 0.75              # word2vec-style smoothing on item counts
     early_stopping:
       patience: 3
       min_delta: 0.001

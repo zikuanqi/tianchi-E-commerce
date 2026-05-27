@@ -48,12 +48,25 @@ class DataProcessor:
         self.categorical_features: List[str] = self.config['data']['features']['categorical']
         self.encoders: Dict[str, LabelEncoder] = {f: LabelEncoder() for f in self.categorical_features}
         self.max_seq_length: int = self.config['data']['features']['sequence']['max_length']
-        self.neg_ratio: int = int(self.config['model']['training'].get('negative_sampling_ratio', 4))
+
+        train_cfg = self.config['model']['training']
+        self.neg_ratio: int = int(train_cfg.get('negative_sampling_ratio', 4))
+        self.neg_strategy: str = str(train_cfg.get('negative_sampling_strategy', 'uniform')).lower()
+        # word2vec-style smoothing exponent on item popularity. Setting
+        # alpha=0 ⇒ uniform; alpha=1 ⇒ pure popularity; 0.75 is the value
+        # that has held up well across recsys/word2vec/SGNS literature.
+        self.neg_alpha: float = float(train_cfg.get('negative_sampling_alpha', 0.75))
+        if self.neg_strategy not in {'uniform', 'popularity'}:
+            raise ValueError(
+                f"negative_sampling_strategy must be 'uniform' or 'popularity', got {self.neg_strategy!r}"
+            )
+
         self.rng = np.random.default_rng(self.config.get('system', {}).get('seed', 42))
 
         # Populated during preprocess_data
         self._all_item_ids: Optional[np.ndarray] = None
         self._item_to_category: Optional[Dict[int, int]] = None
+        self._item_sampling_probs: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # Raw load + preprocessing
@@ -115,6 +128,17 @@ class DataProcessor:
             )
         else:
             self._item_to_category = {}
+
+        # Precompute the popularity sampling distribution. Items unseen
+        # in `user_data` get a small base count so they retain a non-zero
+        # probability — without this, the recommender can never produce
+        # them as negatives and the model never learns to score them low.
+        item_counts = (user_data['item_id_encoded']
+                       .value_counts()
+                       .reindex(self._all_item_ids, fill_value=0)
+                       .to_numpy(dtype=np.float64))
+        smoothed = (item_counts + 1.0) ** self.neg_alpha
+        self._item_sampling_probs = smoothed / smoothed.sum()
         return user_data, item_data
 
     # ------------------------------------------------------------------
@@ -178,11 +202,16 @@ class DataProcessor:
             rows.append((int(u), int(i), 1))
 
         all_items = self._all_item_ids
-        n_items = len(all_items)
+        probs = self._item_sampling_probs if self.neg_strategy == 'popularity' else None
         for user_id, pos_items in user_pos.items():
             needed = self.neg_ratio * len(pos_items)
             # Oversample to account for collisions with positives.
-            sampled = self.rng.choice(all_items, size=needed + len(pos_items), replace=True)
+            sampled = self.rng.choice(
+                all_items,
+                size=needed + len(pos_items),
+                replace=True,
+                p=probs,
+            )
             kept = 0
             for item_id in sampled:
                 if kept >= needed:
