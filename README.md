@@ -113,12 +113,27 @@ seq_behav ──► Behavior Embedding ──concat──► Linear ──► Po
 
 - 正样本：目标日 `behavior_type == 4`（购买）
 - 负样本：该用户当日未购买的随机商品（比例由 `negative_sampling_ratio` 控制）
+- 采样分布：`negative_sampling_strategy: uniform | popularity`，热门加权时使用 word2vec 风格平滑：`p(item) ∝ (count + 1) ^ alpha`，默认 `alpha = 0.75`
+- 可选：in-batch 对比损失（`use_in_batch_negatives: true`），将同一 batch 中其他正样本作为负样本，按温度归一化的余弦相似度做 softmax 交叉熵；通过 `infonce_weight` 与 BCE 主损失加权
+
+### 数值特征
+
+`FeatureEngineer` 从训练窗口（≤ `train_end_date`）的行为中统计每个用户/商品的稠密数值特征：
+
+- 用户：动作总数、独立商品/类别数、四种 behavior 占比、平均小时、周末占比、活跃天数、平均行为间隔
+- 商品：动作总数、独立用户数、四种 behavior 占比、用户多样性
+
+特征 StandardScaler 标准化，并截断到 ±5 σ。零向量用于训练时未见过的冷启动用户/商品。这些数值特征与对应的嵌入向量拼接后进入两塔 MLP。
 
 ## 评估指标
 
-- `train_loss` / `val_loss`（BCE）
-- `val_acc`（二分类阈值 0.5）
-- 后续可通过 `analyze_results.py` 计算精确率/召回率/F1/ROC
+通过 `torchmetrics` 在每个验证 epoch 计算并记录：
+
+- `val_loss`（BCE）
+- `val_acc` 准确率
+- `val_precision`、`val_recall`、`val_f1`
+- `val_auroc`（验证集需同时包含正负样本，否则跳过）
+- 训练侧记录 `train_bce` 与 `train_infonce`（启用 InfoNCE 时）
 
 ## 常见问题
 
@@ -138,6 +153,14 @@ python -m pytest tests/ -v
 綦子宽
 
 ## 更新日志
+
+### v0.4.0 (2026-05-28)
+- 验证集新增 P/R/F1/AUROC 指标
+- 负采样支持 `popularity` 策略，带 word2vec 风格平滑
+- 集成 `FeatureEngineer`：用户/商品数值特征自动进入两塔
+- 引入 `PadLabelEncoder` 把 PAD 固定到索引 0，消除嵌入与特征表的索引漂移
+- 可选 InfoNCE in-batch 对比损失
+- 测试套件扩展到 15 个（CPU 上 ~13 秒）
 
 ### v0.3.0 (2026-05-28)
 - 全面重写数据/模型/训练流水线，使各层接口一致

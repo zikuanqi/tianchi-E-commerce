@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import pytorch_lightning as pl
 import torch
@@ -94,6 +94,15 @@ class DeepRecommender(pl.LightningModule):
 
         self.loss_fn = nn.BCEWithLogitsLoss()
 
+        # Optional in-batch contrastive auxiliary loss. Useful for
+        # two-tower retrieval: each positive (user, item) gets
+        # softmax-normalized against every other positive item in the
+        # batch — no extra negative sampling required.
+        train_cfg = config['model']['training']
+        self.use_in_batch_negatives = bool(train_cfg.get('use_in_batch_negatives', False))
+        self.infonce_temperature = float(train_cfg.get('infonce_temperature', 0.1))
+        self.infonce_weight = float(train_cfg.get('infonce_weight', 0.1))
+
         # Validation metrics. torchmetrics handles aggregation across the
         # epoch so we don't have to accumulate batches ourselves.
         self.val_acc = BinaryAccuracy()
@@ -131,36 +140,88 @@ class DeepRecommender(pl.LightningModule):
         pooled = pooled.masked_fill(all_pad, 0.0)               # zero out cold-start users
         return pooled
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _compute_user_repr(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         user_emb = self.user_embedding(batch['user_id'])
         if self.user_feature_dim > 0:
             user_input = torch.cat([user_emb, batch['user_numerical']], dim=-1)
         else:
             user_input = user_emb
-        user_repr = self.user_tower(user_input)
+        return self.user_tower(user_input)
 
+    def _compute_item_repr(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         item_emb = self.item_embedding(batch['item_id'])
         cat_emb = self.category_embedding(batch['category_id'])
         item_parts = [item_emb, cat_emb]
         if self.item_feature_dim > 0:
             item_parts.append(batch['item_numerical'])
-        item_repr = self.item_tower(torch.cat(item_parts, dim=-1))
+        return self.item_tower(torch.cat(item_parts, dim=-1))
 
+    def _compute_seq_repr(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         seq = batch['sequence']
         seq_repr_raw = self.encode_sequence(seq['items'], seq['behaviors'], seq['mask'])
-        seq_repr = self.sequence_tower(seq_repr_raw)
+        return self.sequence_tower(seq_repr_raw)
 
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        user_repr = self._compute_user_repr(batch)
+        item_repr = self._compute_item_repr(batch)
+        seq_repr = self._compute_seq_repr(batch)
         fused = torch.cat([user_repr, item_repr, seq_repr], dim=-1)
         return self.head(fused).squeeze(-1)                     # [B] logits
+
+    # ------------------------------------------------------------------
+    # In-batch contrastive (InfoNCE)
+    # ------------------------------------------------------------------
+    def _infonce_loss(self,
+                      user_repr: torch.Tensor,
+                      item_repr: torch.Tensor,
+                      batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Treat other users' positives in the batch as negatives.
+
+        Returns None when the batch contains fewer than two positives —
+        you can't form a contrastive set against a single anchor.
+        """
+        positives = batch['label'] > 0.5
+        n_pos = int(positives.sum().item())
+        if n_pos < 2:
+            return None
+
+        user_p = F.normalize(user_repr[positives], dim=-1)
+        item_p = F.normalize(item_repr[positives], dim=-1)
+        sim = (user_p @ item_p.T) / max(self.infonce_temperature, 1e-6)  # [P, P]
+
+        # Mask out same-user off-diagonal cells — a user appearing
+        # twice in the batch with two different positives shouldn't act
+        # as a negative for itself.
+        user_ids_p = batch['user_id'][positives]
+        same_user = user_ids_p.unsqueeze(0) == user_ids_p.unsqueeze(1)
+        eye = torch.eye(n_pos, dtype=torch.bool, device=sim.device)
+        sim = sim.masked_fill(same_user & ~eye, float('-inf'))
+
+        target = torch.arange(n_pos, device=sim.device)
+        return F.cross_entropy(sim, target)
 
     # ------------------------------------------------------------------
     # Lightning hooks
     # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
-        logits = self(batch)
-        loss = self.loss_fn(logits, batch['label'])
-        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
-        return loss
+        user_repr = self._compute_user_repr(batch)
+        item_repr = self._compute_item_repr(batch)
+        seq_repr = self._compute_seq_repr(batch)
+
+        fused = torch.cat([user_repr, item_repr, seq_repr], dim=-1)
+        logits = self.head(fused).squeeze(-1)
+        bce = self.loss_fn(logits, batch['label'])
+        self.log('train_bce', bce, on_step=False, on_epoch=True)
+
+        total = bce
+        if self.use_in_batch_negatives:
+            infonce = self._infonce_loss(user_repr, item_repr, batch)
+            if infonce is not None:
+                self.log('train_infonce', infonce, on_step=False, on_epoch=True)
+                total = bce + self.infonce_weight * infonce
+
+        self.log('train_loss', total, prog_bar=True, on_step=True, on_epoch=True)
+        return total
 
     def validation_step(self, batch, batch_idx):
         logits = self(batch)
