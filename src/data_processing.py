@@ -299,7 +299,7 @@ class DataProcessor:
         return {
             feat: len(enc.classes_)
             for feat, enc in self.encoders.items()
-            if hasattr(enc, 'classes_')
+            if getattr(enc, 'classes_', None) is not None
         }
 
     def get_user_feature_dim(self) -> int:
