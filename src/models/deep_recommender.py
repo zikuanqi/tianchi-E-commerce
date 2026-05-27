@@ -8,6 +8,13 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchmetrics.classification import (
+    BinaryAccuracy,
+    BinaryAUROC,
+    BinaryF1Score,
+    BinaryPrecision,
+    BinaryRecall,
+)
 
 from src.models.layer import PositionalEncoding, build_mlp
 
@@ -77,6 +84,14 @@ class DeepRecommender(pl.LightningModule):
 
         self.loss_fn = nn.BCEWithLogitsLoss()
 
+        # Validation metrics. torchmetrics handles aggregation across the
+        # epoch so we don't have to accumulate batches ourselves.
+        self.val_acc = BinaryAccuracy()
+        self.val_precision = BinaryPrecision()
+        self.val_recall = BinaryRecall()
+        self.val_f1 = BinaryF1Score()
+        self.val_auroc = BinaryAUROC()
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -131,12 +146,34 @@ class DeepRecommender(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         logits = self(batch)
-        loss = self.loss_fn(logits, batch['label'])
-        preds = (torch.sigmoid(logits) > 0.5).float()
-        acc = (preds == batch['label']).float().mean()
-        self.log('val_loss', loss, prog_bar=True)
-        self.log('val_acc', acc, prog_bar=True)
+        labels = batch['label']
+        loss = self.loss_fn(logits, labels)
+        probs = torch.sigmoid(logits)
+        labels_int = labels.int()
+
+        self.val_acc.update(probs, labels_int)
+        self.val_precision.update(probs, labels_int)
+        self.val_recall.update(probs, labels_int)
+        self.val_f1.update(probs, labels_int)
+        self.val_auroc.update(probs, labels_int)
+
+        self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
+
+    def on_validation_epoch_end(self) -> None:
+        # Compute epoch-level metrics (torchmetrics aggregates internally).
+        # AUROC requires both classes in the epoch; skip cleanly otherwise.
+        self.log('val_acc', self.val_acc.compute(), prog_bar=True)
+        self.log('val_precision', self.val_precision.compute(), prog_bar=True)
+        self.log('val_recall', self.val_recall.compute(), prog_bar=True)
+        self.log('val_f1', self.val_f1.compute(), prog_bar=True)
+        try:
+            self.log('val_auroc', self.val_auroc.compute(), prog_bar=True)
+        except (ValueError, RuntimeError):
+            pass
+        for m in (self.val_acc, self.val_precision, self.val_recall,
+                  self.val_f1, self.val_auroc):
+            m.reset()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         return torch.sigmoid(self(batch))

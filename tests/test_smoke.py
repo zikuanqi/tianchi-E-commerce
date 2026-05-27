@@ -52,3 +52,12 @@ def test_predict_runs_after_train(config):
     scores = trainer.predict(test_ds)
     assert scores.shape[0] == len(test_ds)
     assert (scores >= 0).all() and (scores <= 1).all()  # sigmoid output
+
+
+def test_validation_logs_precision_recall_f1(config):
+    trainer = ModelTrainer(config)
+    metrics = trainer.train()
+    # Lightning may suffix metric keys with `_epoch`; accept either form.
+    keys = {k.replace('_epoch', '') for k in metrics}
+    for expected in ('val_loss', 'val_precision', 'val_recall', 'val_f1', 'val_acc'):
+        assert expected in keys, f'missing metric {expected} in {sorted(metrics.keys())}'
