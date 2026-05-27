@@ -13,6 +13,7 @@ import torch
 import yaml
 
 from src.data_processing import DataProcessor
+from src.evaluation import set_precision_recall_f1
 from src.trainer import ModelTrainer
 from src.utils import setup_logging, timer
 
@@ -94,6 +95,76 @@ def predict(config: str, test_date: str, checkpoint: str) -> None:
         logger.info('Wrote %d rows to %s', len(submission), out_path)
     except Exception as exc:
         logger.exception('Prediction failed')
+        raise click.ClickException(str(exc))
+
+
+@cli.command()
+@click.option('--config', '-c', default='config/config.yaml', help='Config file path')
+@click.option('--target-date', default=None,
+              help='Ground-truth date (YYYY-MM-DD). Defaults to training.pred_date')
+@click.option('--cutoff-date', default=None,
+              help='Last history day visible to inference (YYYY-MM-DD). '
+                   'Defaults to the day before --target-date.')
+@click.option('--checkpoint', default=None, help='Checkpoint path; defaults to last.ckpt')
+@click.option('--write-submission', is_flag=True,
+              help='Also write the predicted submission CSV alongside the metrics report')
+@timer
+def evaluate(config: str, target_date: str, cutoff_date: str,
+             checkpoint: str, write_submission: bool) -> None:
+    """Compute competition-style set F1 on a held-out date.
+
+    Runs the *real* inference flow (no peeking at target_date), then
+    compares the top-k recommendation set against actual purchases on
+    target_date restricted to item subset P.
+    """
+    cfg = load_config(config)
+    setup_logging(cfg.get('logging', {}))
+    logger.info('Starting evaluation...')
+
+    try:
+        trainer = ModelTrainer(cfg)
+        ckpt = checkpoint or str(Path(cfg['data']['paths']['checkpoint_dir']) / 'last.ckpt')
+        trainer.load_checkpoint(ckpt)
+
+        target = target_date or cfg['training']['pred_date']
+        import pandas as pd
+        if cutoff_date is None:
+            cutoff = (pd.to_datetime(target) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            cutoff = cutoff_date
+
+        inference_ds, candidates = trainer.data_processor.prepare_inference_data(
+            cutoff_date=cutoff,
+        )
+        scores = trainer.predict(inference_ds)
+        submission = trainer.data_processor.create_submission(scores, candidates)
+        ground_truth = trainer.data_processor.actual_purchases_on(target)
+
+        metrics = set_precision_recall_f1(submission, ground_truth)
+        metrics['cutoff_date'] = cutoff
+        metrics['target_date'] = target
+        metrics['top_k'] = int(cfg['training'].get('top_k', 20))
+
+        output_dir = Path(cfg['data']['paths']['output_dir'])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = output_dir / f'evaluation_{target}.json'
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, indent=2, default=str)
+
+        click.echo(f"F1={metrics['f1']:.4f}  "
+                   f"P={metrics['precision']:.4f}  "
+                   f"R={metrics['recall']:.4f}  "
+                   f"|pred|={metrics['predicted_size']}  "
+                   f"|truth|={metrics['reference_size']}  "
+                   f"TP={metrics['tp']}")
+        logger.info('Evaluation report written to %s', report_path)
+
+        if write_submission:
+            sub_path = output_dir / 'tianchi_mobile_recommendation_predict.csv'
+            submission.to_csv(sub_path, index=False, encoding='utf-8')
+            logger.info('Wrote %d rows to %s', len(submission), sub_path)
+    except Exception as exc:
+        logger.exception('Evaluation failed')
         raise click.ClickException(str(exc))
 
 
