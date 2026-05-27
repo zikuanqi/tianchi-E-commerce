@@ -19,9 +19,8 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
-from sklearn.preprocessing import LabelEncoder
-
 from src.data.dataset import RecommendationDataset
+from src.feature_engineering import FeatureEngineer
 from src.utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -29,6 +28,47 @@ logger = logging.getLogger(__name__)
 
 PURCHASE_BEHAVIOR = 4
 PAD_ID = 0
+PAD_TOKEN = '<pad>'
+
+
+class PadLabelEncoder:
+    """LabelEncoder variant that pins a PAD token at index 0.
+
+    scikit-learn's :class:`LabelEncoder` sorts its classes
+    alphabetically, so a sentinel like ``'<pad>'`` ends up at an index
+    that depends on the rest of the vocabulary. We want PAD at a known
+    index (0) so the model's ``nn.Embedding(padding_idx=0)`` and the
+    FeatureEngineer's PAD-is-zero row stay in sync.
+
+    Unknown values at transform time map to PAD (0) — this is the right
+    behavior for inference on a user/item we never saw during training.
+    """
+
+    def __init__(self) -> None:
+        self.classes_: Optional[np.ndarray] = None
+        self._lookup: Dict[str, int] = {}
+
+    def fit(self, values) -> 'PadLabelEncoder':
+        unique = sorted({str(v) for v in values if str(v) != PAD_TOKEN})
+        self.classes_ = np.array([PAD_TOKEN] + unique, dtype=object)
+        self._lookup = {v: i for i, v in enumerate(self.classes_)}
+        return self
+
+    def transform(self, values) -> np.ndarray:
+        if self.classes_ is None:
+            raise RuntimeError('PadLabelEncoder.fit was not called')
+        return np.fromiter(
+            (self._lookup.get(str(v), PAD_ID) for v in values),
+            dtype=np.int64, count=len(values),
+        )
+
+    def inverse_transform(self, indices) -> np.ndarray:
+        if self.classes_ is None:
+            raise RuntimeError('PadLabelEncoder.fit was not called')
+        idx = np.asarray(indices, dtype=np.int64)
+        in_range = (idx >= 0) & (idx < len(self.classes_))
+        out = np.where(in_range, idx, 0)
+        return self.classes_[out]
 
 
 class DataProcessor:
@@ -46,7 +86,7 @@ class DataProcessor:
         setup_logging(self.config.get('logging', {}))
 
         self.categorical_features: List[str] = self.config['data']['features']['categorical']
-        self.encoders: Dict[str, LabelEncoder] = {f: LabelEncoder() for f in self.categorical_features}
+        self.encoders: Dict[str, PadLabelEncoder] = {f: PadLabelEncoder() for f in self.categorical_features}
         self.max_seq_length: int = self.config['data']['features']['sequence']['max_length']
 
         train_cfg = self.config['model']['training']
@@ -63,10 +103,17 @@ class DataProcessor:
 
         self.rng = np.random.default_rng(self.config.get('system', {}).get('seed', 42))
 
+        # Numerical features (per-user / per-item dense tables) are
+        # computed from training-window history only; fitting happens
+        # inside preprocess_data.
+        self.feature_engineer = FeatureEngineer(self.config)
+
         # Populated during preprocess_data
         self._all_item_ids: Optional[np.ndarray] = None
         self._item_to_category: Optional[Dict[int, int]] = None
         self._item_sampling_probs: Optional[np.ndarray] = None
+        self._user_features_tensor: Optional[torch.Tensor] = None
+        self._item_features_tensor: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Raw load + preprocessing
@@ -107,9 +154,9 @@ class DataProcessor:
                 logger.warning('Categorical feature %s not present in user/item data', feat)
                 continue
             combined = pd.concat(values, ignore_index=True)
-            # Reserve 0 for padding/unknown by adding a sentinel before fit.
-            sentinel = pd.Series(['<pad>'])
-            self.encoders[feat].fit(pd.concat([sentinel, combined], ignore_index=True))
+            # PadLabelEncoder reserves index 0 for the PAD token; real
+            # categorical values are encoded starting from 1.
+            self.encoders[feat].fit(combined)
 
             if feat in user_data.columns:
                 user_data[f'{feat}_encoded'] = self.encoders[feat].transform(user_data[feat].astype(str))
@@ -139,6 +186,18 @@ class DataProcessor:
                        .to_numpy(dtype=np.float64))
         smoothed = (item_counts + 1.0) ** self.neg_alpha
         self._item_sampling_probs = smoothed / smoothed.sum()
+
+        # Fit numerical feature tables on training-window history only.
+        # `vocab_sizes` comes from the same encoders so the tables are
+        # already aligned with the embedding-table row indices.
+        train_end = pd.to_datetime(self.config['training']['train_end_date'])
+        self.feature_engineer.fit(
+            user_data,
+            vocab_sizes=self.get_categorical_dims(),
+            end_date=train_end,
+        )
+        self._user_features_tensor = self.feature_engineer.user_features_tensor()
+        self._item_features_tensor = self.feature_engineer.item_features_tensor()
         return user_data, item_data
 
     # ------------------------------------------------------------------
@@ -222,7 +281,11 @@ class DataProcessor:
                 rows.append((user_id, item_id_int, 0))
                 kept += 1
 
-        df = pd.DataFrame(rows, columns=['user_id', 'item_id', 'label'])
+        df = pd.DataFrame(rows, columns=['user_id', 'item_id', 'label']).astype({
+            'user_id': np.int64,
+            'item_id': np.int64,
+            'label': np.int64,
+        })
         df['category_id'] = df['item_id'].map(self._item_to_category).fillna(PAD_ID).astype(np.int64)
         logger.info('Sampled %d interactions on %s (pos=%d, neg=%d)',
                     len(df), target_date.date(),
@@ -238,6 +301,12 @@ class DataProcessor:
             for feat, enc in self.encoders.items()
             if hasattr(enc, 'classes_')
         }
+
+    def get_user_feature_dim(self) -> int:
+        return self.feature_engineer.user_feature_dim
+
+    def get_item_feature_dim(self) -> int:
+        return self.feature_engineer.item_feature_dim
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -256,8 +325,16 @@ class DataProcessor:
         train_interactions = self.sample_interactions(user_data, train_end)
         val_interactions = self.sample_interactions(user_data, val_date)
 
-        train_ds = RecommendationDataset(train_interactions, sequences, self.max_seq_length)
-        val_ds = RecommendationDataset(val_interactions, sequences, self.max_seq_length)
+        train_ds = RecommendationDataset(
+            train_interactions, sequences, self.max_seq_length,
+            user_features=self._user_features_tensor,
+            item_features=self._item_features_tensor,
+        )
+        val_ds = RecommendationDataset(
+            val_interactions, sequences, self.max_seq_length,
+            user_features=self._user_features_tensor,
+            item_features=self._item_features_tensor,
+        )
         return train_ds, val_ds
 
     def prepare_test_data(self, test_date: Optional[str] = None) -> RecommendationDataset:
@@ -270,7 +347,11 @@ class DataProcessor:
 
         sequences = self.build_user_sequences(user_data, target)
         interactions = self.sample_interactions(user_data, target)
-        return RecommendationDataset(interactions, sequences, self.max_seq_length)
+        return RecommendationDataset(
+            interactions, sequences, self.max_seq_length,
+            user_features=self._user_features_tensor,
+            item_features=self._item_features_tensor,
+        )
 
     # ------------------------------------------------------------------
     # Submission

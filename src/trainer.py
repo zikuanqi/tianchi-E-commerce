@@ -133,8 +133,16 @@ class ModelTrainer:
         vocab_sizes = self.data_processor.get_categorical_dims()
         if not vocab_sizes:
             raise RuntimeError('No vocab sizes available — call prepare_data first')
-        logger.info('Building model with vocab sizes: %s', vocab_sizes)
-        self.model = DeepRecommender(self.config, vocab_sizes=vocab_sizes)
+        user_feat_dim = self.data_processor.get_user_feature_dim()
+        item_feat_dim = self.data_processor.get_item_feature_dim()
+        logger.info('Building model with vocab sizes: %s, user_feat_dim=%d, item_feat_dim=%d',
+                    vocab_sizes, user_feat_dim, item_feat_dim)
+        self.model = DeepRecommender(
+            self.config,
+            vocab_sizes=vocab_sizes,
+            user_feature_dim=user_feat_dim,
+            item_feature_dim=item_feat_dim,
+        )
         return self.model
 
     def train(self,

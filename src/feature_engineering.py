@@ -1,307 +1,243 @@
-import gc
-import os
-import psutil
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Union, Tuple
+"""Per-user and per-item numerical feature tables.
+
+This module computes dense numerical features keyed by *encoded* user_id
+and item_id (i.e. the same int ids the model's embedding tables use).
+Features are standardized so they're directly usable as model inputs.
+
+The output is a pair of numpy tables that can be indexed directly:
+
+    user_feature_table[encoded_user_id]   -> [user_feature_dim]
+    item_feature_table[encoded_item_id]   -> [item_feature_dim]
+
+Row 0 (the PAD sentinel) is always zero, so a cold-start lookup sees the
+post-standardization mean.
+"""
+
+from __future__ import annotations
+
 import logging
 from pathlib import Path
-import yaml
-from tqdm import tqdm
+from typing import Dict, Optional, Sequence, Union
+
+import numpy as np
+import pandas as pd
 import torch
+import yaml
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
+
+USER_FEATURE_NAMES: Sequence[str] = (
+    'total_actions',
+    'unique_items',
+    'unique_categories',
+    'behavior_1_ratio',
+    'behavior_2_ratio',
+    'behavior_3_ratio',
+    'behavior_4_ratio',
+    'avg_hour',
+    'weekend_ratio',
+    'action_days',
+    'avg_time_diff_hours',
+)
+
+ITEM_FEATURE_NAMES: Sequence[str] = (
+    'total_actions',
+    'unique_users',
+    'behavior_1_ratio',
+    'behavior_2_ratio',
+    'behavior_3_ratio',
+    'behavior_4_ratio',
+    'user_diversity',
+)
+
+
+def _behavior_ratio_table(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """For each grouping key, return ratios of behaviors 1..4 (one column each)."""
+    pivot = (df.assign(_n=1)
+               .pivot_table(index=key, columns='behavior_type',
+                            values='_n', aggfunc='sum', fill_value=0))
+    totals = pivot.sum(axis=1).replace(0, np.nan)
+    ratios = pivot.div(totals, axis=0).fillna(0.0)
+    for b in (1, 2, 3, 4):
+        if b not in ratios.columns:
+            ratios[b] = 0.0
+    return ratios[[1, 2, 3, 4]]
+
+
 class FeatureEngineer:
-    def __init__(self, config: Union[str, dict]):
-        # 加载配置
+    """Compute, standardize, and serve per-id numerical feature tables."""
+
+    def __init__(self, config: Union[str, Path, dict, None] = None):
         if isinstance(config, (str, Path)):
-            with open(config) as f:
+            with open(config, 'r', encoding='utf-8') as f:
                 self.config = yaml.safe_load(f)
         elif isinstance(config, dict):
             self.config = config
+        elif config is None:
+            self.config = {}
         else:
-            raise TypeError("config must be either a path (str) or a dictionary")
-            
-        # 特征配置
-        self.feature_config = self.config['data']['features']
-        self.sequence_config = self.feature_config['sequence']
-        self.max_seq_length = self.sequence_config['max_length']
-        
-        # 内存配置
-        self.chunk_size = self.feature_config.get('chunk_size', 100000)
-        self.memory_optimize = self.feature_config.get('memory_optimize', True)
-        
-        # 初始化标准化器
-        self.scalers = {
-            'user_numerical': StandardScaler(),
-            'item_numerical': StandardScaler(),
-            'sequence_numerical': StandardScaler()
-        }
+            raise TypeError('config must be a path, dict, or None')
 
-    def generate_features(self, df: pd.DataFrame, end_date: str) -> Dict[str, torch.Tensor]:
-        """生成所有特征"""
-        logger.info("Starting feature generation...")
-        end_date = pd.to_datetime(end_date)
-        
-        try:
-            # 1. 生成用户特征
-            user_features = self._generate_user_features(df)
-            self._check_memory_usage("After user features")
+        self.user_scaler = StandardScaler()
+        self.item_scaler = StandardScaler()
+        self.user_feature_table: Optional[np.ndarray] = None  # [n_users, D_u]
+        self.item_feature_table: Optional[np.ndarray] = None  # [n_items, D_i]
 
-            # 2. 生成商品特征
-            item_features = self._generate_item_features(df)
-            self._check_memory_usage("After item features")
+    # ------------------------------------------------------------------
+    # Public dims (constants — kept as properties so callers don't depend
+    # on whether `fit` has run yet)
+    # ------------------------------------------------------------------
+    @property
+    def user_feature_dim(self) -> int:
+        return len(USER_FEATURE_NAMES)
 
-            # 3. 生成序列特征
-            sequence_features = self._generate_sequence_features(df)
-            self._check_memory_usage("After sequence features")
+    @property
+    def item_feature_dim(self) -> int:
+        return len(ITEM_FEATURE_NAMES)
 
-            # 4. 生成时序特征
-            temporal_features = self._generate_temporal_features(df)
-            self._check_memory_usage("After temporal features")
+    # ------------------------------------------------------------------
+    # Fit
+    # ------------------------------------------------------------------
+    def fit(self,
+            user_data: pd.DataFrame,
+            vocab_sizes: Dict[str, int],
+            end_date: Optional[pd.Timestamp] = None) -> 'FeatureEngineer':
+        """Compute and standardize feature tables from `user_data`.
 
-            # 合并所有特征
-            features = {
-                'user': user_features,
-                'item': item_features,
-                'sequence': sequence_features,
-                'temporal': temporal_features
-            }
+        `vocab_sizes` is the dict returned by
+        :meth:`DataProcessor.get_categorical_dims`. It pins the table
+        sizes so unseen ids at inference time get a zero feature row.
 
-            return self._convert_to_tensors(features)
+        `end_date` (optional) restricts the window used to compute
+        training features — pass it as the train cut-off so we never
+        leak validation/test rows into the standardization fit.
+        """
+        df = user_data
+        if end_date is not None:
+            df = df[df['time'] <= end_date]
 
-        except Exception as e:
-            logger.error(f"Error in feature generation: {str(e)}")
-            raise
+        n_users = int(vocab_sizes.get('user_id', 0))
+        n_items = int(vocab_sizes.get('item_id', 0))
+        if n_users == 0 or n_items == 0:
+            raise ValueError(f'vocab_sizes must include user_id and item_id; got {vocab_sizes}')
 
-    def _generate_user_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """生成用户特征"""
-        features = {}
-        
-        # 分批处理用户
-        unique_users = df['user_id_encoded'].unique()
-        user_features_list = []
-        
-        for chunk_start in range(0, len(unique_users), self.chunk_size):
-            chunk_users = unique_users[chunk_start:chunk_start + self.chunk_size]
-            chunk = df[df['user_id_encoded'].isin(chunk_users)]
-            
-            # 基础统计特征
-            user_stats = chunk.groupby('user_id_encoded').agg({
-                'behavior_type': ['count', 'nunique'],
-                'item_id_encoded': 'nunique',
-                'category_encoded': 'nunique'
-            })
-            
-            # 用户行为分布
-            behavior_features = pd.get_dummies(chunk['behavior_type'])\
-                .groupby(chunk['user_id_encoded']).mean()
-            
-            # 类别偏好
-            category_features = pd.get_dummies(chunk['category_encoded'])\
-                .groupby(chunk['user_id_encoded']).mean()
-            
-            # 时间特征
-            time_features = chunk.groupby('user_id_encoded').agg({
-                'time': [
-                    lambda x: x.dt.hour.mean(),
-                    lambda x: x.dt.weekday.mean(),
-                    lambda x: len(x.dt.date.unique())
-                ]
-            })
-            
-            # 合并特征
-            chunk_features = pd.concat([
-                user_stats, behavior_features, category_features, time_features
-            ], axis=1)
-            
-            user_features_list.append(chunk_features)
-            self._check_memory_usage()
-        
-        # 合并所有批次
-        user_features = pd.concat(user_features_list)
-        
-        # 标准化数值特征
-        numerical_cols = user_features.select_dtypes(include=['float64', 'int64']).columns
-        user_features[numerical_cols] = self.scalers['user_numerical'].fit_transform(
-            user_features[numerical_cols]
-        )
-        
-        return user_features.to_dict('series')
+        self.user_feature_table = self._fit_user_features(df, n_users)
+        self.item_feature_table = self._fit_item_features(df, n_items)
+        logger.info('FeatureEngineer.fit: user table %s, item table %s',
+                    self.user_feature_table.shape, self.item_feature_table.shape)
+        return self
 
-    def _generate_item_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """生成商品特征"""
-        features = {}
-        
-        # 分批处理商品
-        unique_items = df['item_id_encoded'].unique()
-        item_features_list = []
-        
-        for chunk_start in range(0, len(unique_items), self.chunk_size):
-            chunk_items = unique_items[chunk_start:chunk_start + self.chunk_size]
-            chunk = df[df['item_id_encoded'].isin(chunk_items)]
-            
-            # 商品统计特征
-            item_stats = chunk.groupby('item_id_encoded').agg({
-                'user_id_encoded': ['count', 'nunique'],
-                'behavior_type': ['nunique', 'mean'],
-                'time': lambda x: len(pd.to_datetime(x).dt.date.unique())
-            })
-            
-            # 商品行为分布
-            behavior_features = pd.get_dummies(chunk['behavior_type'])\
-                .groupby(chunk['item_id_encoded']).mean()
-            
-            # 用户多样性
-            user_diversity = chunk.groupby('item_id_encoded')\
-                .agg({'user_id_encoded': lambda x: len(x.unique()) / len(x)})
-            
-            # 合并特征
-            chunk_features = pd.concat([
-                item_stats, behavior_features, user_diversity
-            ], axis=1)
-            
-            item_features_list.append(chunk_features)
-            self._check_memory_usage()
-        
-        # 合并所有批次
-        item_features = pd.concat(item_features_list)
-        
-        # 标准化数值特征
-        numerical_cols = item_features.select_dtypes(include=['float64', 'int64']).columns
-        item_features[numerical_cols] = self.scalers['item_numerical'].fit_transform(
-            item_features[numerical_cols]
-        )
-        
-        return item_features.to_dict('series')
+    # ------------------------------------------------------------------
+    # User-side feature computation
+    # ------------------------------------------------------------------
+    def _fit_user_features(self, df: pd.DataFrame, n_users: int) -> np.ndarray:
+        out = np.zeros((n_users, self.user_feature_dim), dtype=np.float32)
+        if df.empty:
+            return out
 
-    def _generate_sequence_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """生成序列特征"""
-        # 按用户和时间排序
-        df = df.sort_values(['user_id_encoded', 'time'])
-        
-        # 初始化序列特征
-        sequences = {
-            'item_seq': [],
-            'behavior_seq': [],
-            'time_seq': [],
-            'category_seq': [],
-            'mask': []
-        }
-        
-        # 分批处理用户
-        unique_users = df['user_id_encoded'].unique()
-        
-        for chunk_start in range(0, len(unique_users), self.chunk_size):
-            chunk_users = unique_users[chunk_start:chunk_start + self.chunk_size]
-            chunk = df[df['user_id_encoded'].isin(chunk_users)]
-            
-            for user_id, user_data in chunk.groupby('user_id_encoded'):
-                # 获取最近的行为序列
-                recent_actions = user_data.iloc[-self.max_seq_length:]
-                seq_length = len(recent_actions)
-                
-                # 填充序列
-                item_seq = np.zeros(self.max_seq_length, dtype=np.int32)
-                behavior_seq = np.zeros(self.max_seq_length, dtype=np.int32)
-                category_seq = np.zeros(self.max_seq_length, dtype=np.int32)
-                time_seq = np.zeros(self.max_seq_length, dtype=np.float32)
-                mask = np.ones(self.max_seq_length, dtype=np.bool_)
-                
-                # 填充实际数据
-                item_seq[:seq_length] = recent_actions['item_id_encoded'].values
-                behavior_seq[:seq_length] = recent_actions['behavior_type'].values
-                category_seq[:seq_length] = recent_actions['category_encoded'].values
-                time_seq[:seq_length] = recent_actions['time'].astype(np.int64) // 10**9
-                mask[:seq_length] = False
-                
-                # 添加到序列集合
-                sequences['item_seq'].append(item_seq)
-                sequences['behavior_seq'].append(behavior_seq)
-                sequences['category_seq'].append(category_seq)
-                sequences['time_seq'].append(time_seq)
-                sequences['mask'].append(mask)
-            
-            self._check_memory_usage()
-        
-        return {k: np.array(v) for k, v in sequences.items()}
-
-    def _generate_temporal_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """生成时间特征"""
-        # 提取时间特征
-        df['hour'] = df['time'].dt.hour
-        df['day'] = df['time'].dt.day
-        df['weekday'] = df['time'].dt.weekday
-        df['is_weekend'] = df['weekday'].isin([5, 6]).astype(int)
-        
-        # 计算时间差特征
-        df['time_diff'] = df.groupby('user_id_encoded')['time'].diff().dt.total_seconds()
-        
-        temporal_features = df.groupby('user_id_encoded').agg({
-            'hour': ['mean', 'std'],
-            'weekday': ['mean', 'std'],
-            'is_weekend': 'mean',
-            'time_diff': ['mean', 'std', 'max', 'min']
-        }).fillna(0)
-        
-        # 标准化
-        temporal_features = pd.DataFrame(
-            self.scalers['sequence_numerical'].fit_transform(temporal_features),
-            index=temporal_features.index,
-            columns=temporal_features.columns
-        )
-        
-        return temporal_features.to_dict('series')
-
-    def _convert_to_tensors(self, features: Dict) -> Dict[str, torch.Tensor]:
-        """将特征转换为PyTorch张量"""
-        tensor_features = {}
-        
-        for feature_type, feature_dict in features.items():
-            if feature_type == 'sequence':
-                # 序列特征需要特殊处理
-                tensor_features[feature_type] = {
-                    k: torch.tensor(v, dtype=torch.long if k != 'time_seq' else torch.float)
-                    for k, v in feature_dict.items()
-                }
-            else:
-                # 其他特征直接转换为张量
-                tensor_features[feature_type] = {
-                    k: torch.tensor(v.values, dtype=torch.float)
-                    for k, v in feature_dict.items()
-                }
-                
-        return tensor_features
-
-    def _check_memory_usage(self, stage: str = ""):
-        """检查内存使用情况"""
-        if self.memory_optimize:
-            process = psutil.Process(os.getpid())
-            memory_info = process.memory_info()
-            current_memory = memory_info.rss / 1024 / 1024  # MB
-            
-            logger.info(f"Memory usage {stage}: {current_memory:.2f} MB")
-            
-            if current_memory > self.config.get('system', {}).get('memory_optimize', {}).get('max_memory_gb', 16) * 1024:
-                logger.warning(f"High memory usage detected. Triggering garbage collection...")
-                gc.collect()
-
-if __name__ == "__main__":
-    # 测试特征工程
-    from data_processing import DataProcessor
-    
-    processor = DataProcessor('config/config.yaml')
-    user_data, item_data, _ = processor.load_processed_data()
-    
-    engineer = FeatureEngineer('config/config.yaml')
-    features = engineer.generate_features(user_data, '2014-12-18')
-    
-    # 打印特征信息
-    for feature_type, feature_dict in features.items():
-        if isinstance(feature_dict, dict):
-            for name, tensor in feature_dict.items():
-                print(f"{feature_type} - {name}: {tensor.shape}")
+        grouped = df.groupby('user_id_encoded', sort=False)
+        total = grouped.size().rename('total_actions')
+        unique_items = grouped['item_id_encoded'].nunique().rename('unique_items')
+        if 'category_encoded' in df.columns:
+            unique_cats = grouped['category_encoded'].nunique().rename('unique_categories')
         else:
-            print(f"{feature_type}: {feature_dict.shape}")
+            unique_cats = pd.Series(0, index=total.index, name='unique_categories')
+
+        beh_ratios = _behavior_ratio_table(df, 'user_id_encoded')
+        avg_hour = (grouped['hour'].mean().rename('avg_hour')
+                    if 'hour' in df.columns
+                    else pd.Series(0.0, index=total.index, name='avg_hour'))
+
+        if 'weekday' in df.columns:
+            df_local = df.assign(_wknd=df['weekday'].isin([5, 6]).astype(float))
+            weekend_ratio = df_local.groupby('user_id_encoded')['_wknd'].mean().rename('weekend_ratio')
+        else:
+            weekend_ratio = pd.Series(0.0, index=total.index, name='weekend_ratio')
+
+        action_days = (df.assign(_d=df['time'].dt.date)
+                         .groupby('user_id_encoded')['_d']
+                         .nunique()
+                         .rename('action_days'))
+
+        # Average inter-action gap in hours, per user.
+        sorted_df = df.sort_values(['user_id_encoded', 'time'])
+        gaps = sorted_df.groupby('user_id_encoded')['time'].diff().dt.total_seconds() / 3600.0
+        avg_diff = gaps.groupby(sorted_df['user_id_encoded']).mean().fillna(0.0).rename('avg_time_diff_hours')
+
+        index = total.index.to_numpy()
+        cols = np.column_stack([
+            total.to_numpy(dtype=np.float32),
+            unique_items.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+            unique_cats.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[1].to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[2].to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[3].to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[4].to_numpy(dtype=np.float32),
+            avg_hour.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+            weekend_ratio.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+            action_days.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+            avg_diff.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+        ])
+
+        cols = self.user_scaler.fit_transform(cols).astype(np.float32)
+        # Clamp the standardized values so a single outlier user can't
+        # blow up gradients. ±5 σ is generous but bounded.
+        np.clip(cols, -5.0, 5.0, out=cols)
+
+        mask = (index >= 0) & (index < n_users)
+        out[index[mask]] = cols[mask]
+        return out
+
+    # ------------------------------------------------------------------
+    # Item-side feature computation
+    # ------------------------------------------------------------------
+    def _fit_item_features(self, df: pd.DataFrame, n_items: int) -> np.ndarray:
+        out = np.zeros((n_items, self.item_feature_dim), dtype=np.float32)
+        if df.empty:
+            return out
+
+        grouped = df.groupby('item_id_encoded', sort=False)
+        total = grouped.size().rename('total_actions')
+        unique_users = grouped['user_id_encoded'].nunique().rename('unique_users')
+        beh_ratios = _behavior_ratio_table(df, 'item_id_encoded')
+        user_diversity = (unique_users / total.replace(0, np.nan)).fillna(0.0).rename('user_diversity')
+
+        index = total.index.to_numpy()
+        cols = np.column_stack([
+            total.to_numpy(dtype=np.float32),
+            unique_users.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[1].to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[2].to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[3].to_numpy(dtype=np.float32),
+            beh_ratios.reindex(index).fillna(0)[4].to_numpy(dtype=np.float32),
+            user_diversity.reindex(index).fillna(0).to_numpy(dtype=np.float32),
+        ])
+
+        cols = self.item_scaler.fit_transform(cols).astype(np.float32)
+        np.clip(cols, -5.0, 5.0, out=cols)
+
+        mask = (index >= 0) & (index < n_items)
+        out[index[mask]] = cols[mask]
+        return out
+
+    # ------------------------------------------------------------------
+    # Tensor accessors
+    # ------------------------------------------------------------------
+    def user_features_tensor(self) -> torch.Tensor:
+        if self.user_feature_table is None:
+            raise RuntimeError('FeatureEngineer.fit was not called')
+        return torch.from_numpy(self.user_feature_table)
+
+    def item_features_tensor(self) -> torch.Tensor:
+        if self.item_feature_table is None:
+            raise RuntimeError('FeatureEngineer.fit was not called')
+        return torch.from_numpy(self.item_feature_table)
+
+
+__all__ = [
+    'FeatureEngineer',
+    'USER_FEATURE_NAMES',
+    'ITEM_FEATURE_NAMES',
+]

@@ -28,6 +28,10 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
             'length': torch.stack([b['sequence']['length'] for b in batch]),
         },
     }
+    if 'user_numerical' in batch[0]:
+        out['user_numerical'] = torch.stack([b['user_numerical'] for b in batch])
+    if 'item_numerical' in batch[0]:
+        out['item_numerical'] = torch.stack([b['item_numerical'] for b in batch])
     return out
 
 

@@ -2,6 +2,7 @@
 
 from src.data.dataset import RecommendationDataset
 from src.data_processing import DataProcessor
+from src.feature_engineering import FeatureEngineer
 from src.models.deep_recommender import DeepRecommender
 from src.trainer import ModelTrainer
 from src.utils import (
@@ -21,6 +22,7 @@ __author__ = '綦子宽'
 
 __all__ = [
     'DataProcessor',
+    'FeatureEngineer',
     'RecommendationDataset',
     'DeepRecommender',
     'ModelTrainer',

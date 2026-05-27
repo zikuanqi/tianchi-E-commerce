@@ -33,12 +33,23 @@ class DeepRecommender(pl.LightningModule):
     Sigmoid + BCE.
     """
 
-    def __init__(self, config: dict, vocab_sizes: Dict[str, int]):
+    def __init__(self,
+                 config: dict,
+                 vocab_sizes: Dict[str, int],
+                 user_feature_dim: int = 0,
+                 item_feature_dim: int = 0):
         super().__init__()
         # Lightning saves these so checkpoints are self-describing.
-        self.save_hyperparameters({'config': config, 'vocab_sizes': vocab_sizes})
+        self.save_hyperparameters({
+            'config': config,
+            'vocab_sizes': vocab_sizes,
+            'user_feature_dim': user_feature_dim,
+            'item_feature_dim': item_feature_dim,
+        })
         self.config = config
         self.vocab_sizes = vocab_sizes
+        self.user_feature_dim = int(user_feature_dim)
+        self.item_feature_dim = int(item_feature_dim)
 
         arch = config['model']['architecture']
         d_emb = int(arch['embedding_dim'])
@@ -58,11 +69,10 @@ class DeepRecommender(pl.LightningModule):
         self.category_embedding = nn.Embedding(vocab_sizes.get('category', 1) + 1, d_emb, padding_idx=0)
         self.behavior_embedding = nn.Embedding(behavior_vocab, behavior_dim, padding_idx=0)
 
-        # User tower: just user_id → hidden
-        self.user_tower = build_mlp(d_emb, hidden_dims, dropout=dropout)
-
-        # Item tower: item ⊕ category → hidden
-        self.item_tower = build_mlp(d_emb * 2, hidden_dims, dropout=dropout)
+        # Each tower consumes its categorical embedding(s) plus, optionally,
+        # dense numerical features computed by FeatureEngineer.
+        self.user_tower = build_mlp(d_emb + self.user_feature_dim, hidden_dims, dropout=dropout)
+        self.item_tower = build_mlp(d_emb * 2 + self.item_feature_dim, hidden_dims, dropout=dropout)
 
         # Sequence tower: project item⊕behavior into d_model, then attend
         d_model = d_emb + behavior_dim
@@ -122,11 +132,19 @@ class DeepRecommender(pl.LightningModule):
         return pooled
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        user_repr = self.user_tower(self.user_embedding(batch['user_id']))
+        user_emb = self.user_embedding(batch['user_id'])
+        if self.user_feature_dim > 0:
+            user_input = torch.cat([user_emb, batch['user_numerical']], dim=-1)
+        else:
+            user_input = user_emb
+        user_repr = self.user_tower(user_input)
 
         item_emb = self.item_embedding(batch['item_id'])
         cat_emb = self.category_embedding(batch['category_id'])
-        item_repr = self.item_tower(torch.cat([item_emb, cat_emb], dim=-1))
+        item_parts = [item_emb, cat_emb]
+        if self.item_feature_dim > 0:
+            item_parts.append(batch['item_numerical'])
+        item_repr = self.item_tower(torch.cat(item_parts, dim=-1))
 
         seq = batch['sequence']
         seq_repr_raw = self.encode_sequence(seq['items'], seq['behaviors'], seq['mask'])
