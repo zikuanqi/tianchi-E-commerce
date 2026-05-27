@@ -1,22 +1,6 @@
-"""
-深度学习模型模块
-包含模型定义和网络层
-"""
+"""Model package."""
 
 from .deep_recommender import DeepRecommender
-from .layer import (
-    UserEncoder,
-    ItemEncoder,
-    SequenceEncoder,
-    MultiHeadAttention,
-    PositionalEncoding
-)
+from .layer import PositionalEncoding, build_mlp
 
-__all__ = [
-    'DeepRecommender',
-    'UserEncoder',
-    'ItemEncoder',
-    'SequenceEncoder',
-    'MultiHeadAttention',
-    'PositionalEncoding'
-]
+__all__ = ['DeepRecommender', 'PositionalEncoding', 'build_mlp']

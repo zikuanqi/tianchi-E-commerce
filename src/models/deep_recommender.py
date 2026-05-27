@@ -1,169 +1,158 @@
+"""Two-tower + sequence recommender."""
+
+from __future__ import annotations
+
+from typing import Dict
+
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
-from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-class UserEncoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.user_embeddings = nn.ModuleDict({
-            feat: nn.Embedding(num_embeddings, config['features']['user']['embedding_size'])
-            for feat, num_embeddings in config['features']['user']['categorical_dims'].items()
-        })
-        
-        num_numerical = len(config['features']['user']['numerical'])
-        total_dims = (num_numerical + 
-                     len(self.user_embeddings) * config['features']['user']['embedding_size'])
-        
-        self.fc = nn.Linear(total_dims, config['model']['architecture']['hidden_dims'][0])
-        
-    def forward(self, user_features):
-        numerical = user_features['numerical']
-        categorical = user_features['categorical']
-        
-        embeddings = []
-        for feat, embedding_layer in self.user_embeddings.items():
-            embeddings.append(embedding_layer(categorical[feat]))
-            
-        x = torch.cat([numerical] + embeddings, dim=1)
-        return self.fc(x)
+from src.models.layer import PositionalEncoding, build_mlp
 
-class ItemEncoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.item_embeddings = nn.ModuleDict({
-            feat: nn.Embedding(num_embeddings, config['features']['item']['embedding_size'])
-            for feat, num_embeddings in config['features']['item']['categorical_dims'].items()
-        })
-        
-        num_numerical = len(config['features']['item']['numerical'])
-        total_dims = (num_numerical + 
-                     len(self.item_embeddings) * config['features']['item']['embedding_size'])
-        
-        self.fc = nn.Linear(total_dims, config['model']['architecture']['hidden_dims'][0])
-        
-    def forward(self, item_features):
-        numerical = item_features['numerical']
-        categorical = item_features['categorical']
-        
-        embeddings = []
-        for feat, embedding_layer in self.item_embeddings.items():
-            embeddings.append(embedding_layer(categorical[feat]))
-            
-        x = torch.cat([numerical] + embeddings, dim=1)
-        return self.fc(x)
-
-class SequenceEncoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.item_encoder = ItemEncoder(config)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=config['model']['architecture']['hidden_dims'][0],
-                nhead=8,
-                dim_feedforward=config['model']['architecture']['hidden_dims'][0] * 4,
-                dropout=config['model']['architecture']['dropout']
-            ),
-            num_layers=2
-        )
-        
-    def forward(self, sequence_features, mask=None):
-        # sequence_features shape: [batch_size, seq_len, feature_dim]
-        item_embeddings = self.item_encoder(sequence_features)
-        
-        if mask is None:
-            mask = torch.zeros(item_embeddings.size(0), item_embeddings.size(1)).bool()
-            
-        return self.transformer(item_embeddings.transpose(0, 1), src_key_padding_mask=mask).transpose(0, 1)
 
 class DeepRecommender(pl.LightningModule):
-    def __init__(self, config):
+    """Two-tower + sequence model.
+
+    - User tower: embedding(user_id) → MLP
+    - Item tower: embedding(item_id) ⊕ embedding(category_id) → MLP
+    - Sequence tower: embedding(seq_items) ⊕ embedding(seq_behaviors) →
+      positional encoding → Transformer encoder → masked mean-pool
+    - Concatenate the three representations and project to a logit.
+
+    The model emits a logit (not a probability) and uses
+    `BCEWithLogitsLoss`, which is numerically more stable than
+    Sigmoid + BCE.
+    """
+
+    def __init__(self, config: dict, vocab_sizes: Dict[str, int]):
         super().__init__()
-        self.save_hyperparameters()
+        # Lightning saves these so checkpoints are self-describing.
+        self.save_hyperparameters({'config': config, 'vocab_sizes': vocab_sizes})
         self.config = config
-        
-        # Encoders
-        self.user_encoder = UserEncoder(config)
-        self.item_encoder = ItemEncoder(config)
-        self.sequence_encoder = SequenceEncoder(config)
-        
-        # Fusion layers
-        hidden_dims = config['model']['architecture']['hidden_dims']
-        input_dim = hidden_dims[0] * 3  # user + item + sequence
-        
-        layers = []
-        prev_dim = input_dim
-        
-        for dim in hidden_dims[1:]:
-            layers.extend([
-                nn.Linear(prev_dim, dim),
-                nn.ReLU(),
-                nn.BatchNorm1d(dim),
-                nn.Dropout(config['model']['architecture']['dropout'])
-            ])
-            prev_dim = dim
-            
-        layers.append(nn.Linear(prev_dim, 1))
-        layers.append(nn.Sigmoid())
-        
-        self.fusion = nn.Sequential(*layers)
-        
-    def forward(self, batch):
-        user_features = batch['user_features']
-        item_features = batch['item_features']
-        sequence_features = batch['sequence_features']
-        sequence_mask = batch['sequence_mask']
-        
-        user_embedding = self.user_encoder(user_features)
-        item_embedding = self.item_encoder(item_features)
-        sequence_embedding = self.sequence_encoder(sequence_features, sequence_mask)
-        sequence_embedding = sequence_embedding.mean(dim=1)  # pool sequence
-        
-        # Concatenate all features
-        combined = torch.cat([
-            user_embedding,
-            item_embedding,
-            sequence_embedding
-        ], dim=1)
-        
-        return self.fusion(combined)
-    
-    def training_step(self, batch, batch_idx):
-        y_hat = self(batch)
-        loss = F.binary_cross_entropy(y_hat, batch['labels'])
-        
-        self.log('train_loss', loss)
-        return loss
-    
-    def validation_step(self, batch, batch_idx):
-        y_hat = self(batch)
-        loss = F.binary_cross_entropy(y_hat, batch['labels'])
-        
-        # Calculate metrics
-        preds = (y_hat > 0.5).float()
-        acc = (preds == batch['labels']).float().mean()
-        
-        self.log('val_loss', loss)
-        self.log('val_acc', acc)
-        
-        return loss
-    
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.config['model']['training']['learning_rate'],
-            weight_decay=self.config['model']['training']['weight_decay']
+        self.vocab_sizes = vocab_sizes
+
+        arch = config['model']['architecture']
+        d_emb = int(arch['embedding_dim'])
+        hidden_dims = list(arch['hidden_dims'])
+        dropout = float(arch['dropout'])
+        n_heads = int(arch['num_attention_heads'])
+        n_layers = int(arch['num_transformer_layers'])
+        ff_dim = int(arch.get('transformer_ff_dim', d_emb * 4))
+
+        seq_cfg = config['data']['features']['sequence']
+        behavior_vocab = int(seq_cfg['num_behaviors'])
+        behavior_dim = int(seq_cfg['behavior_dim'])
+
+        # +1 on every embedding size: id 0 is the explicit PAD sentinel.
+        self.user_embedding = nn.Embedding(vocab_sizes['user_id'] + 1, d_emb, padding_idx=0)
+        self.item_embedding = nn.Embedding(vocab_sizes['item_id'] + 1, d_emb, padding_idx=0)
+        self.category_embedding = nn.Embedding(vocab_sizes.get('category', 1) + 1, d_emb, padding_idx=0)
+        self.behavior_embedding = nn.Embedding(behavior_vocab, behavior_dim, padding_idx=0)
+
+        # User tower: just user_id → hidden
+        self.user_tower = build_mlp(d_emb, hidden_dims, dropout=dropout)
+
+        # Item tower: item ⊕ category → hidden
+        self.item_tower = build_mlp(d_emb * 2, hidden_dims, dropout=dropout)
+
+        # Sequence tower: project item⊕behavior into d_model, then attend
+        d_model = d_emb + behavior_dim
+        self.seq_input_proj = nn.Linear(d_model, d_emb)
+        self.positional_encoding = PositionalEncoding(d_emb, max_len=seq_cfg['max_length'])
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_emb,
+            nhead=n_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
         )
-        
+        self.sequence_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.sequence_tower = build_mlp(d_emb, hidden_dims, dropout=dropout)
+
+        # Fusion head
+        fusion_in = hidden_dims[-1] * 3
+        self.head = build_mlp(fusion_in, [fusion_in // 2], dropout=dropout, output_dim=1)
+
+        self.loss_fn = nn.BCEWithLogitsLoss()
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def encode_sequence(self,
+                        seq_items: torch.Tensor,
+                        seq_behaviors: torch.Tensor,
+                        seq_mask: torch.Tensor) -> torch.Tensor:
+        """[B, L] ints + bool mask → [B, d_emb] pooled representation."""
+        item_emb = self.item_embedding(seq_items)              # [B, L, d_emb]
+        beh_emb = self.behavior_embedding(seq_behaviors)        # [B, L, behavior_dim]
+        seq = torch.cat([item_emb, beh_emb], dim=-1)            # [B, L, d_emb+behavior_dim]
+        seq = self.seq_input_proj(seq)                          # [B, L, d_emb]
+        seq = self.positional_encoding(seq)
+
+        # If every position is padding (cold-start user with empty seq),
+        # the transformer would NaN out — fall back to zeros.
+        all_pad = seq_mask.all(dim=1, keepdim=True)             # [B, 1]
+        safe_mask = seq_mask.clone()
+        safe_mask[all_pad.squeeze(1)] = False  # let attention run, then we'll zero it out
+
+        encoded = self.sequence_encoder(seq, src_key_padding_mask=safe_mask)  # [B, L, d_emb]
+
+        # Masked mean over non-pad positions
+        keep = (~seq_mask).float().unsqueeze(-1)                # [B, L, 1]
+        denom = keep.sum(dim=1).clamp(min=1.0)                  # [B, 1]
+        pooled = (encoded * keep).sum(dim=1) / denom            # [B, d_emb]
+        pooled = pooled.masked_fill(all_pad, 0.0)               # zero out cold-start users
+        return pooled
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        user_repr = self.user_tower(self.user_embedding(batch['user_id']))
+
+        item_emb = self.item_embedding(batch['item_id'])
+        cat_emb = self.category_embedding(batch['category_id'])
+        item_repr = self.item_tower(torch.cat([item_emb, cat_emb], dim=-1))
+
+        seq = batch['sequence']
+        seq_repr_raw = self.encode_sequence(seq['items'], seq['behaviors'], seq['mask'])
+        seq_repr = self.sequence_tower(seq_repr_raw)
+
+        fused = torch.cat([user_repr, item_repr, seq_repr], dim=-1)
+        return self.head(fused).squeeze(-1)                     # [B] logits
+
+    # ------------------------------------------------------------------
+    # Lightning hooks
+    # ------------------------------------------------------------------
+    def training_step(self, batch, batch_idx):
+        logits = self(batch)
+        loss = self.loss_fn(logits, batch['label'])
+        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        logits = self(batch)
+        loss = self.loss_fn(logits, batch['label'])
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        acc = (preds == batch['label']).float().mean()
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_acc', acc, prog_bar=True)
+        return loss
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        return torch.sigmoid(self(batch))
+
+    def configure_optimizers(self):
+        train_cfg = self.config['model']['training']
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=float(train_cfg['learning_rate']),
+            weight_decay=float(train_cfg.get('weight_decay', 0.0)),
+        )
+        sched_cfg = train_cfg.get('scheduler', {})
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.config['model']['training']['scheduler']['T_max'],
-            eta_min=self.config['model']['training']['scheduler']['eta_min']
+            T_max=int(sched_cfg.get('T_max', train_cfg.get('num_epochs', 10))),
+            eta_min=float(sched_cfg.get('eta_min', 1e-6)),
         )
-        
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': scheduler,
-            'monitor': 'val_loss'
-        }
+        return {'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'}}
