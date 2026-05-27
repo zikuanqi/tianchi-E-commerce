@@ -1,2 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.ipynb_checkpoints/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project data (large or sensitive)
 data/processed/processed_user_data.pkl
 data/raw/tianchi_fresh_comp_train_user_2w.csv
+data/raw/tianchi_fresh_comp_train_item_2w.csv
+data/processed/
+data/checkpoints/
+data/output/
+checkpoints/
+logs/
+lightning_logs/
+*.ckpt
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db

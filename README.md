@@ -32,7 +32,7 @@ mobile_recommendation/
 │   ├── models/
 │   │   ├── __init__.py
 │   │   ├── deep_recommender.py  # 深度推荐模型
-│   │   └── layers.py           # 模型层定义
+│   │   └── layer.py            # 模型层定义
 │   ├── data_processing.py    # 数据处理
 │   ├── feature_engineering.py # 特征工程
 │   ├── trainer.py            # 训练管理

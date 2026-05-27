@@ -4,7 +4,7 @@
 """
 
 from .deep_recommender import DeepRecommender
-from .layers import (
+from .layer import (
     UserEncoder,
     ItemEncoder,
     SequenceEncoder,
